@@ -1,0 +1,100 @@
+//@version=5
+indicator("ICT Smart Money Structure Detector", overlay=true, max_labels_count=500)
+
+// === INPUTS ===
+tf_list = input.string("5,15,60", title="Timeframes (comma separated)")
+min_conf = input.int(75, title="Min Confidence Score")
+fvg_min_size = input.float(0.0005, title="Min FVG Size (%)", step=0.0001)
+confluence_required = input.int(2, title="Min Confluences for Alert")
+
+
+// === SWING HIGH/LOW ===
+swing_high(len) => high[len] < high[len-1] and high[len-1] > high[len-2]
+swing_low(len) => low[len] > low[len-1] and low[len-1] < low[len-2]
+
+// === CHoCH & BoS DETECTION ===
+var float prev_high = na
+var float prev_low = na
+var int choch = 0
+var int bos = 0
+if swing_high(1)
+    prev_high := high[1]
+if swing_low(1)
+    prev_low := low[1]
+if not na(prev_high) and close > prev_high
+    bos := 1
+else
+    bos := 0
+if not na(prev_low) and close < prev_low
+    choch := 1
+else
+    choch := 0
+
+// === FVG DETECTION ===
+fvg_up = low[1] > high[2] and (low[1] - high[2]) / close > fvg_min_size
+fvg_dn = high[1] < low[2] and (high[1] - low[2]) / close > fvg_min_size
+
+// === LIQUIDITY SWEEPS ===
+eq_highs = math.abs(high - high[1]) < syminfo.mintick * 2
+eq_lows = math.abs(low - low[1]) < syminfo.mintick * 2
+sweep_high = eq_highs and high > high[1]
+sweep_low = eq_lows and low < low[1]
+
+// === PREMIUM/DISCOUNT ZONES ===
+range_high = ta.highest(high, 20)
+range_low = ta.lowest(low, 20)
+mid = (range_high + range_low) / 2
+in_premium = close > mid
+in_discount = close < mid
+
+// === MULTI-TIMEFRAME CONFLUENCE ===
+tf_arr = str.split(tf_list, ",")
+htf_bull = request.security(syminfo.tickerid, tf_arr[1], close > ta.sma(close, 20))
+htf_bear = request.security(syminfo.tickerid, tf_arr[1], close < ta.sma(close, 20))
+
+// === CONFLUENCE COUNT ===
+confluences = 0
+confluences += bos ? 1 : 0
+confluences += choch ? 1 : 0
+confluences += fvg_up or fvg_dn ? 1 : 0
+confluences += sweep_high or sweep_low ? 1 : 0
+confluences += in_premium or in_discount ? 1 : 0
+confluences += htf_bull or htf_bear ? 1 : 0
+
+// === SIGNAL FILTERING ===
+signal_type = bos ? "BoS" : choch ? "CHoCH" : fvg_up ? "FVG Up" : fvg_dn ? "FVG Down" : sweep_high ? "Sweep High" : sweep_low ? "Sweep Low" : ""
+confidence = math.min(100, 60 + confluences * 10)
+should_alert = confluences >= confluence_required and confidence >= min_conf and signal_type != ""
+
+// === STOP LOSS / TAKE PROFIT SUGGESTIONS ===
+sl = bos or choch ? low : fvg_up ? low[1] : fvg_dn ? high[1] : sweep_high ? low : sweep_low ? high : na
+tp = bos or choch ? high : fvg_up ? high[1] : fvg_dn ? low[1] : sweep_high ? high : sweep_low ? low : na
+
+// === ALERT PAYLOAD ===
+alert_json = '{'
+    + '"symbol":"' + syminfo.ticker + '",'
+    + '"timeframe":"' + timeframe.period + '",'
+    + '"signal_type":"' + signal_type + '",'
+    + '"confidence":' + str.tostring(confidence) + ','
+    + '"timestamp":' + str.tostring(time) + ','
+    + '"price_data":{' + '"open":' + str.tostring(open) + ',"high":' + str.tostring(high) + ',"low":' + str.tostring(low) + ',"close":' + str.tostring(close) + '},'
+    + '"sl":' + str.tostring(sl) + ','
+    + '"tp":' + str.tostring(tp) + '
+}'
+
+// === ALERT ===
+alertcondition(should_alert, title="ICT High-Quality Signal", message=alert_json)
+
+// === CHART LABELS ===
+if bos
+    label.new(bar_index, high, "BoS", color=color.green, style=label.style_label_up, textcolor=color.white)
+if choch
+    label.new(bar_index, low, "CHoCH", color=color.red, style=label.style_label_down, textcolor=color.white)
+if fvg_up
+    box.new(bar_index-2, high[2], bar_index-1, low[1], color=color.new(color.green, 80), border_color=color.green)
+if fvg_dn
+    box.new(bar_index-2, low[2], bar_index-1, high[1], color=color.new(color.red, 80), border_color=color.red)
+if sweep_high
+    label.new(bar_index, high, "Sweep High", color=color.purple, style=label.style_label_up, textcolor=color.white)
+if sweep_low
+    label.new(bar_index, low, "Sweep Low", color=color.purple, style=label.style_label_down, textcolor=color.white)
