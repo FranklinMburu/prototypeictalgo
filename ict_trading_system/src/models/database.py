@@ -52,8 +52,22 @@ class Setting(Base):
 
 
 
-# SQLite/aiosqlite does not support connection pooling arguments
-DATABASE_URL = settings.DATABASE_URL.replace('sqlite:///', 'sqlite+aiosqlite:///')
+
+# --- Database Engine Selection Logic ---
+# Supports SQLite (aiosqlite), PostgreSQL (asyncpg), MySQL (aiomysql)
+import re
+raw_url = settings.DATABASE_URL
+if raw_url.startswith('sqlite:///'):
+    DATABASE_URL = raw_url.replace('sqlite:///', 'sqlite+aiosqlite:///')
+elif raw_url.startswith('postgresql://') or raw_url.startswith('postgres://'):
+    # Convert to asyncpg driver if not already
+    DATABASE_URL = re.sub(r'^postgresql://', 'postgresql+asyncpg://', raw_url)
+    DATABASE_URL = re.sub(r'^postgres://', 'postgresql+asyncpg://', DATABASE_URL)
+elif raw_url.startswith('mysql://'):
+    DATABASE_URL = raw_url.replace('mysql://', 'mysql+aiomysql://')
+else:
+    raise ValueError(f"Unsupported DB URL: {raw_url}")
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,

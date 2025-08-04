@@ -1,0 +1,13 @@
+# requirements.txt for Docker build
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+aiosqlite
+asyncpg
+aiomysql
+python-dotenv
+sentry-sdk[fastapi]
+httpx
+python-telegram-bot
+openai
+# Add any other dependencies your project uses

@@ -1,58 +1,158 @@
 //@version=5
-indicator("ICT Smart Money Structure Detector", overlay=true, max_labels_count=500)
+indicator("ICT Profit-Focused Detector", overlay=true, max_labels_count=500)
 
-// === INPUTS ===
-tf_list = input.string("5,15,60", title="Timeframes (comma separated)")
-min_conf = input.int(75, title="Min Confidence Score")
-fvg_min_size = input.float(0.0005, title="Min FVG Size (%)", step=0.0001)
-confluence_required = input.int(2, title="Min Confluences for Alert")
+// === INPUTS (Prompt Spec) ===
+swing_length = input.int(20, title="Swing Detection Length")
+fvg_min_pips = input.int(10, title="Min FVG Size (pips)")
+max_daily_signals = input.int(5, title="Max Signals Per Day")
+cooldown_bars = input.int(10, title="Signal Cooldown (bars)")
+tf_list = input.string("60,240,1440", title="HTF List (comma sep, min)")
+session_tz_offset = input.int(-5, title="Session Timezone Offset (hours, e.g. -5=NY)")
+
+// === REQUIRED VARIABLES (For Backend Integration) ===
+
+var bool high_prob_buy = false
+var bool high_prob_sell = false
+var float entry_price = na
+var float stop_loss = na
+var float take_profit = na
+var int confidence = 0  // 1-100 scale
+var string setup_type = ""
+var int signal_count_today = 0
+var int last_signal_bar = na // FIXED: removed duplicate cooldown_bars declaration
+var bool is_london_session = false
+var bool is_ny_session = false
+var bool is_trending_market = false
+var float daily_high = na
+var float daily_low = na
+var float premium_zone = na
+var float discount_zone = na
+// === STRUCTURE CONTEXT (Major Swing/Key Level Detection) ===
+var float major_swing_high = na
+var float major_swing_low = na
+var float key_resistance = na
+var float key_support = na
+var int swing_high_touches = 0
+var int swing_low_touches = 0
+var bool valid_major_high = false
+var bool valid_major_low = false
 
 
-// === SWING HIGH/LOW ===
-swing_high(len) => high[len] < high[len-1] and high[len-1] > high[len-2]
-swing_low(len) => low[len] > low[len-1] and low[len-1] < low[len-2]
 
-// === CHoCH & BoS DETECTION ===
-var float prev_high = na
-var float prev_low = na
+// === SESSION & KILLZONE DETECTION (EXACT TIMES, EXCHANGE TZ, Robust) === // FIXED:
+sess_time = not na(time) ? (time + session_tz_offset * 3600000) : na // FIXED:
+current_hour = not na(sess_time) ? hour(sess_time) : na // FIXED:
+current_day = not na(sess_time) ? dayofweek(sess_time) : na // FIXED:
+is_london_session = (not na(current_hour) and not na(current_day)) ? ((current_hour >= 2 and current_hour < 5) and (current_day >= dayofweek.monday and current_day <= dayofweek.friday)) : false // FIXED:
+is_ny_session = (not na(current_hour) and not na(current_day)) ? ((current_hour >= 7 and current_hour < 10) and (current_day >= dayofweek.monday and current_day <= dayofweek.friday)) : false // FIXED:
+killzone_active = is_london_session or is_ny_session // FIXED:
+plotchar(killzone_active, char="K", location=location.top, color=color.blue, size=size.small, title="Killzone Active") // FIXED:
+
+
+// === MAJOR STRUCTURE DETECTION (Pivot-based, Persistent) ===
+var float[] swing_highs = array.new_float()
+var int[] swing_high_bars = array.new_int()
+var float[] swing_lows = array.new_float()
+var int[] swing_low_bars = array.new_int()
+
+is_swing_high = ta.pivothigh(high, swing_length, swing_length)
+is_swing_low = ta.pivotlow(low, swing_length, swing_length)
+
+if not na(is_swing_high)
+    array.unshift(swing_highs, is_swing_high)
+    array.unshift(swing_high_bars, bar_index - swing_length)
+if not na(is_swing_low)
+    array.unshift(swing_lows, is_swing_low)
+    array.unshift(swing_low_bars, bar_index - swing_length)
+
+// Only keep last 10 swings
+if array.size(swing_highs) > 10
+    array.pop(swing_highs)
+    array.pop(swing_high_bars)
+if array.size(swing_lows) > 10
+    array.pop(swing_lows)
+    array.pop(swing_low_bars)
+
+major_swing_high = array.size(swing_highs) > 0 ? array.get(swing_highs, 0) : na
+major_swing_low = array.size(swing_lows) > 0 ? array.get(swing_lows, 0) : na
+
+// === CHoCH & BoS DETECTION (ICT Corrected) ===
 var int choch = 0
 var int bos = 0
-if swing_high(1)
-    prev_high := high[1]
-if swing_low(1)
-    prev_low := low[1]
-if not na(prev_high) and close > prev_high
-    bos := 1
-else
-    bos := 0
-if not na(prev_low) and close < prev_low
-    choch := 1
-else
-    choch := 0
+var float prev_swing_high = na
+var float prev_swing_low = na
 
-// === FVG DETECTION ===
-fvg_up = low[1] > high[2] and (low[1] - high[2]) / close > fvg_min_size
-fvg_dn = high[1] < low[2] and (high[1] - low[2]) / close > fvg_min_size
+// === ARRAY ACCESS SAFETY & LOGIC CORRECTION (CHoCH/BoS) === // FIXED:
+if array.size(swing_highs) > 1 and array.size(swing_lows) > 1 // FIXED:
+    prev_swing_high := array.size(swing_highs) > 1 ? array.get(swing_highs, 1) : na // FIXED:
+    prev_swing_low := array.size(swing_lows) > 1 ? array.get(swing_lows, 1) : na // FIXED:
 
-// === LIQUIDITY SWEEPS ===
-eq_highs = math.abs(high - high[1]) < syminfo.mintick * 2
-eq_lows = math.abs(low - low[1]) < syminfo.mintick * 2
-sweep_high = eq_highs and high > high[1]
-sweep_low = eq_lows and low < low[1]
+// Detect bullish CHoCH (actual break below prev swing low after making higher high) // FIXED:
+choch := (not na(prev_swing_low) and not na(prev_swing_high) and ta.crossunder(close, prev_swing_low) and high > prev_swing_high) ? 1 : 0 // FIXED:
+// Detect bullish BoS (actual break above prev swing high after higher low) // FIXED:
+bos := (not na(prev_swing_high) and not na(prev_swing_low) and ta.crossover(close, prev_swing_high) and low > prev_swing_low) ? 1 : 0 // FIXED:
 
-// === PREMIUM/DISCOUNT ZONES ===
-range_high = ta.highest(high, 20)
-range_low = ta.lowest(low, 20)
-mid = (range_high + range_low) / 2
-in_premium = close > mid
-in_discount = close < mid
 
-// === MULTI-TIMEFRAME CONFLUENCE ===
-tf_arr = str.split(tf_list, ",")
-htf_bull = request.security(syminfo.tickerid, tf_arr[1], close > ta.sma(close, 20))
-htf_bear = request.security(syminfo.tickerid, tf_arr[1], close < ta.sma(close, 20))
+// === FVG DETECTION (Gap-based, Robust) ===
+pip_size = syminfo.type == "forex" ? (syminfo.mintick * 10) : syminfo.mintick
+// === ARRAY ACCESS SAFETY FOR FVG === // FIXED:
+fvg_up = (bar_index > 2 and not na(low[1]) and not na(high[2]) and (low[1] > high[2]) and ((low[1] - high[2]) / pip_size >= fvg_min_pips)) // FIXED:
+fvg_dn = (bar_index > 2 and not na(high[1]) and not na(low[2]) and (high[1] < low[2]) and ((high[1] - low[2]) / pip_size >= fvg_min_pips)) // FIXED:
 
-// === CONFLUENCE COUNT ===
+// FVG fill tracking
+var float fvg_up_fill = na
+var float fvg_dn_fill = na
+fvg_up_filled = false
+fvg_dn_filled = false
+if fvg_up // FIXED:
+    fvg_up_fill := not na(high[2]) ? high[2] : na // FIXED:
+if not na(fvg_up_fill) and not na(low) and low <= fvg_up_fill // FIXED:
+    fvg_up_filled := true // FIXED:
+    fvg_up_fill := na // FIXED:
+if fvg_dn // FIXED:
+    fvg_dn_fill := not na(low[2]) ? low[2] : na // FIXED:
+if not na(fvg_dn_fill) and not na(high) and high >= fvg_dn_fill // FIXED:
+    fvg_dn_filled := true // FIXED:
+    fvg_dn_fill := na // FIXED:
+
+// === LIQUIDITY SWEEPS (Equal High/Low + Reversal) ===
+liq_pip_dist = input.int(3, title="Equal High/Low Max Distance (pips)")
+eq_highs = math.abs(high - high[1]) / pip_size <= liq_pip_dist
+eq_lows = math.abs(low - low[1]) / pip_size <= liq_pip_dist
+sweep_high = eq_highs and high > high[1] and close < open
+sweep_low = eq_lows and low < low[1] and close > open
+
+
+// === DAILY RANGE, PREMIUM, DISCOUNT ZONES (ICT Method) ===
+// Calculate at session open, not midnight
+daily_high := ta.highest(high, 24)
+daily_low := ta.lowest(low, 24)
+daily_range = daily_high - daily_low
+premium_zone := daily_low + (daily_range * 0.75)  // Upper 25%
+discount_zone := daily_low + (daily_range * 0.25) // Lower 25%
+
+// For backend variables // FIXED: removed self-assignments
+
+in_premium = close >= premium_zone
+in_discount = close <= discount_zone
+
+// === MULTI-TIMEFRAME CONFLUENCE (Robust, Manual Parsing) === // FIXED:
+var string tf1 = "60" // FIXED:
+var string tf2 = "240" // FIXED:
+var string tf3 = "1440" // FIXED:
+var int comma1 = str.indexof(tf_list, ",") // FIXED:
+var int comma2 = str.indexof(tf_list, ",", comma1 + 1) // FIXED:
+if comma1 != -1 // FIXED:
+    tf1 := str.substring(tf_list, 0, comma1) // FIXED:
+    if comma2 != -1 // FIXED:
+        tf2 := str.substring(tf_list, comma1 + 1, comma2) // FIXED:
+        tf3 := str.substring(tf_list, comma2 + 1, str.length(tf_list)) // FIXED:
+    else // FIXED:
+        tf2 := str.substring(tf_list, comma1 + 1, str.length(tf_list)) // FIXED:
+htf_bull = request.security(syminfo.tickerid, tf2, close > ta.sma(close, 20)) // FIXED:
+htf_bear = request.security(syminfo.tickerid, tf2, close < ta.sma(close, 20)) // FIXED:
+
+// === CONFLUENCE COUNT (add structure context) ===
 confluences = 0
 confluences += bos ? 1 : 0
 confluences += choch ? 1 : 0
@@ -60,17 +160,50 @@ confluences += fvg_up or fvg_dn ? 1 : 0
 confluences += sweep_high or sweep_low ? 1 : 0
 confluences += in_premium or in_discount ? 1 : 0
 confluences += htf_bull or htf_bear ? 1 : 0
+confluences += valid_major_high or valid_major_low ? 1 : 0
 
-// === SIGNAL FILTERING ===
-signal_type = bos ? "BoS" : choch ? "CHoCH" : fvg_up ? "FVG Up" : fvg_dn ? "FVG Down" : sweep_high ? "Sweep High" : sweep_low ? "Sweep Low" : ""
-confidence = math.min(100, 60 + confluences * 10)
-should_alert = confluences >= confluence_required and confidence >= min_conf and signal_type != ""
 
-// === STOP LOSS / TAKE PROFIT SUGGESTIONS ===
-sl = bos or choch ? low : fvg_up ? low[1] : fvg_dn ? high[1] : sweep_high ? low : sweep_low ? high : na
-tp = bos or choch ? high : fvg_up ? high[1] : fvg_dn ? low[1] : sweep_high ? high : sweep_low ? low : na
+// === STRICT PATTERN FILTERING (ICT High-Probability Only, Robust, Array Safety) === // FIXED:
+bos_at_high = bos and not na(major_swing_high) and not na(high) and math.abs(high - major_swing_high) < syminfo.mintick * 3 // FIXED:
+choch_at_low = choch and not na(major_swing_low) and not na(low) and math.abs(low - major_swing_low) < syminfo.mintick * 3 // FIXED:
+fvg_up_strict = fvg_up and in_discount and not na(major_swing_low) and bar_index > 1 and not na(low[1]) and math.abs(low[1] - major_swing_low) < syminfo.mintick * 3 // FIXED:
+fvg_dn_strict = fvg_dn and in_premium and not na(major_swing_high) and bar_index > 1 and not na(high[1]) and math.abs(high[1] - major_swing_high) < syminfo.mintick * 3 // FIXED:
+sweep_high_strict = sweep_high and not na(major_swing_high) and not na(high) and math.abs(high - major_swing_high) < syminfo.mintick * 3 // FIXED:
+sweep_low_strict = sweep_low and not na(major_swing_low) and not na(low) and math.abs(low - major_swing_low) < syminfo.mintick * 3 // FIXED:
+in_killzone = killzone_active
+strict_confluence = confluences >= 4
 
-// === ALERT PAYLOAD ===
+signal_type = bos_at_high ? "BoS@High" : choch_at_low ? "CHoCH@Low" : fvg_up_strict ? "FVG Up@Low" : fvg_dn_strict ? "FVG Down@High" : sweep_high_strict ? "Sweep High@High" : sweep_low_strict ? "Sweep Low@Low" : ""
+
+// === Daily signal cap and cooldown ===
+var int signal_count_today = 0
+var int last_signal_bar = na
+new_day = ta.change(time("D")) != 0
+if new_day
+    signal_count_today := 0
+can_signal = (signal_count_today < max_daily_signals)
+cooldown_ok = na(last_signal_bar) or (bar_index - last_signal_bar > cooldown_bars)
+should_alert = signal_type != "" and in_killzone and strict_confluence and can_signal and cooldown_ok
+if should_alert
+    signal_count_today += 1
+    last_signal_bar := bar_index
+
+confidence = math.min(100, 70 + confluences * 5)
+
+// === STOP LOSS / TAKE PROFIT SUGGESTIONS (Array Safety) === // FIXED:
+sl = bos or choch ? low : (fvg_up and bar_index > 1 and not na(low[1])) ? low[1] : (fvg_dn and bar_index > 1 and not na(high[1])) ? high[1] : sweep_high ? low : sweep_low ? high : na // FIXED:
+tp = bos or choch ? high : (fvg_up and bar_index > 1 and not na(high[1])) ? high[1] : (fvg_dn and bar_index > 1 and not na(low[1])) ? low[1] : sweep_high ? high : sweep_low ? low : na // FIXED:
+
+
+// === BACKEND VARIABLE ASSIGNMENTS (Integration) === // FIXED:
+high_prob_buy := should_alert and (bos_at_high or fvg_up_strict or sweep_low_strict) // FIXED:
+high_prob_sell := should_alert and (choch_at_low or fvg_dn_strict or sweep_high_strict) // FIXED:
+entry_price := should_alert ? close : na // FIXED:
+stop_loss := should_alert ? sl : na // FIXED:
+take_profit := should_alert ? tp : na // FIXED:
+setup_type := should_alert ? signal_type : "" // FIXED:
+
+// === ALERT PAYLOAD (Expanded, with structure context) ===
 alert_json = '{'
     + '"symbol":"' + syminfo.ticker + '",'
     + '"timeframe":"' + timeframe.period + '",'
@@ -79,22 +212,41 @@ alert_json = '{'
     + '"timestamp":' + str.tostring(time) + ','
     + '"price_data":{' + '"open":' + str.tostring(open) + ',"high":' + str.tostring(high) + ',"low":' + str.tostring(low) + ',"close":' + str.tostring(close) + '},'
     + '"sl":' + str.tostring(sl) + ','
-    + '"tp":' + str.tostring(tp) + '
-}'
+    + '"tp":' + str.tostring(tp) + ','
+    + '"multi_tf":{' + '"htf_bull":' + str.tostring(htf_bull) + ',"htf_bear":' + str.tostring(htf_bear) + '},'
+    + '"structure":{' + '"major_swing_high":' + str.tostring(major_swing_high) + ',"major_swing_low":' + str.tostring(major_swing_low) + ',"key_resistance":' + str.tostring(key_resistance) + ',"key_support":' + str.tostring(key_support) + ',"valid_major_high":' + str.tostring(valid_major_high) + ',"valid_major_low":' + str.tostring(valid_major_low) + '},'
+    + '"backend":{' // FIXED:
+        + '"high_prob_buy":' + str.tostring(high_prob_buy) + ',' // FIXED:
+        + '"high_prob_sell":' + str.tostring(high_prob_sell) + ',' // FIXED:
+        + '"entry_price":' + str.tostring(entry_price) + ',' // FIXED:
+        + '"stop_loss":' + str.tostring(stop_loss) + ',' // FIXED:
+        + '"take_profit":' + str.tostring(take_profit) + ',' // FIXED:
+        + '"setup_type":"' + setup_type + '"' // FIXED:
+    + '},' // FIXED:
+    + '"confluences":{' + '"bos":' + str.tostring(bos) + ',"choch":' + str.tostring(choch) + ',"fvg_up":' + str.tostring(fvg_up) + ',"fvg_dn":' + str.tostring(fvg_dn) + ',"fvg_up_filled":' + str.tostring(fvg_up_filled) + ',"fvg_dn_filled":' + str.tostring(fvg_dn_filled) + ',"sweep_high":' + str.tostring(sweep_high) + ',"sweep_low":' + str.tostring(sweep_low) + ',"in_premium":' + str.tostring(in_premium) + ',"in_discount":' + str.tostring(in_discount) + '}'
+    + '}'
 
 // === ALERT ===
 alertcondition(should_alert, title="ICT High-Quality Signal", message=alert_json)
 
-// === CHART LABELS ===
-if bos
-    label.new(bar_index, high, "BoS", color=color.green, style=label.style_label_up, textcolor=color.white)
-if choch
-    label.new(bar_index, low, "CHoCH", color=color.red, style=label.style_label_down, textcolor=color.white)
-if fvg_up
-    box.new(bar_index-2, high[2], bar_index-1, low[1], color=color.new(color.green, 80), border_color=color.green)
-if fvg_dn
-    box.new(bar_index-2, low[2], bar_index-1, high[1], color=color.new(color.red, 80), border_color=color.red)
-if sweep_high
-    label.new(bar_index, high, "Sweep High", color=color.purple, style=label.style_label_up, textcolor=color.white)
-if sweep_low
-    label.new(bar_index, low, "Sweep Low", color=color.purple, style=label.style_label_down, textcolor=color.white)
+// === CHART LABELS (add structure context, robust, Array Safety) === // FIXED:
+if bos and not na(high) // FIXED:
+    label.new(bar_index, high, "BoS", color=color.green, style=label.style_label_up, textcolor=color.white) // FIXED:
+if choch and not na(low) // FIXED:
+    label.new(bar_index, low, "CHoCH", color=color.red, style=label.style_label_down, textcolor=color.white) // FIXED:
+if fvg_up and bar_index > 2 and not na(high[2]) and not na(low[1]) // FIXED:
+    box.new(bar_index-2, high[2], bar_index-1, low[1], color=color.new(color.green, 80), border_color=color.green) // FIXED:
+    if fvg_up_filled and not na(low[1]) // FIXED:
+        label.new(bar_index, low[1], "FVG Up Filled", color=color.green, style=label.style_label_down, textcolor=color.white) // FIXED:
+if fvg_dn and bar_index > 2 and not na(low[2]) and not na(high[1]) // FIXED:
+    box.new(bar_index-2, low[2], bar_index-1, high[1], color=color.new(color.red, 80), border_color=color.red) // FIXED:
+    if fvg_dn_filled and not na(high[1]) // FIXED:
+        label.new(bar_index, high[1], "FVG Down Filled", color=color.red, style=label.style_label_up, textcolor=color.white) // FIXED:
+if sweep_high and not na(high) // FIXED:
+    label.new(bar_index, high, "Sweep High", color=color.purple, style=label.style_label_up, textcolor=color.white) // FIXED:
+if sweep_low and not na(low) // FIXED:
+    label.new(bar_index, low, "Sweep Low", color=color.purple, style=label.style_label_down, textcolor=color.white) // FIXED:
+if not na(major_swing_high) // FIXED:
+    label.new(bar_index, major_swing_high, "Major High", color=color.orange, style=label.style_label_up, textcolor=color.white) // FIXED:
+if not na(major_swing_low) // FIXED:
+    label.new(bar_index, major_swing_low, "Major Low", color=color.orange, style=label.style_label_down, textcolor=color.white) // FIXED:
