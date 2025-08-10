@@ -1,3 +1,28 @@
+import requests
+import os
+
+def send_telegram_message(message: str) -> bool:
+    """
+    Sends a message to a Telegram chat using a bot token and chat ID from environment variables.
+    Returns True if successful, False otherwise.
+    """
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        print("Telegram bot token or chat ID not set in environment.")
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            return True
+        else:
+            print(f"Telegram error: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+        return False
 
 import logging
 import asyncio
