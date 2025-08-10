@@ -1,252 +1,1012 @@
 //@version=5
-indicator("ICT Profit-Focused Detector", overlay=true, max_labels_count=500)
+indicator("Hybrid ICT Trading System [Pro]", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=3000)
+//=============================================================================
+// RESTORE: OB open buffer input and premium/discount zone logic (pre-refactor compatibility)
+//=============================================================================
 
-// === INPUTS (Prompt Spec) ===
-swing_length = input.int(20, title="Swing Detection Length")
-fvg_min_pips = input.int(10, title="Min FVG Size (pips)")
-max_daily_signals = input.int(5, title="Max Signals Per Day")
-cooldown_bars = input.int(10, title="Signal Cooldown (bars)")
-tf_list = input.string("60,240,1440", title="HTF List (comma sep, min)")
-session_tz_offset = input.int(-5, title="Session Timezone Offset (hours, e.g. -5=NY)")
+// OB open buffer (missing input)
+ob_open_buffer_ticks = input.int(2, title="OB Open Buffer (ticks)", group="Order Blocks", minval=1, maxval=10)
 
-// === REQUIRED VARIABLES (For Backend Integration) ===
+// Premium/Discount zones (legacy logic for retracement/zone gating)
+daily_low_24 = ta.lowest(low, 24)
+daily_high_24 = ta.highest(high, 24)
+daily_range = daily_high_24 - daily_low_24
+premium_zone = daily_range > 0 ? daily_low_24 + (daily_range * 0.75) : high
+discount_zone = daily_range > 0 ? daily_low_24 + (daily_range * 0.25) : low
 
-var bool high_prob_buy = false
-var bool high_prob_sell = false
-var float entry_price = na
-var float stop_loss = na
-var float take_profit = na
-var int confidence = 0  // 1-100 scale
-var string setup_type = ""
-var int signal_count_today = 0
-var int last_signal_bar = na // FIXED: removed duplicate cooldown_bars declaration
-var bool is_london_session = false
-var bool is_ny_session = false
-var bool is_trending_market = false
-var float daily_high = na
-var float daily_low = na
-var float premium_zone = na
-var float discount_zone = na
-// === STRUCTURE CONTEXT (Major Swing/Key Level Detection) ===
-var float major_swing_high = na
-var float major_swing_low = na
-var float key_resistance = na
-var float key_support = na
-var int swing_high_touches = 0
-var int swing_low_touches = 0
-var bool valid_major_high = false
-var bool valid_major_low = false
+//=============================================================================
+// INPUTS - Combined from both systems
+//=============================================================================
 
 
+// Market Structure & Signal Generation
+grp1 = "Market Structure & Signals"
+swing_length = input.int(5, title="Swing Detection Length", group=grp1, minval=3, maxval=10)
+showMS = input.bool(true, title="Show Market Structure", group=grp1)
+iMSS = input.bool(true, title="Show MSS", group=grp1, inline="mss")
+cMSSbl = input.color(color.new(#00e6a1, 0), title="Bull", group=grp1, inline="mss")
+cMSSbr = input.color(color.new(#e60400, 0), title="Bear", group=grp1, inline="mss")
+iBOS = input.bool(true, title="Show BOS", group=grp1, inline="bos")
+cBOSbl = input.color(color.new(#00e6a1, 0), title="Bull", group=grp1, inline="bos")
+cBOSbr = input.color(color.new(#e60400, 0), title="Bear", group=grp1, inline="bos")
 
-// === SESSION & KILLZONE DETECTION (EXACT TIMES, EXCHANGE TZ, Robust) === // FIXED:
-sess_time = not na(time) ? (time + session_tz_offset * 3600000) : na // FIXED:
-current_hour = not na(sess_time) ? hour(sess_time) : na // FIXED:
-current_day = not na(sess_time) ? dayofweek(sess_time) : na // FIXED:
-is_london_session = (not na(current_hour) and not na(current_day)) ? ((current_hour >= 2 and current_hour < 5) and (current_day >= dayofweek.monday and current_day <= dayofweek.friday)) : false // FIXED:
-is_ny_session = (not na(current_hour) and not na(current_day)) ? ((current_hour >= 7 and current_hour < 10) and (current_day >= dayofweek.monday and current_day <= dayofweek.friday)) : false // FIXED:
-killzone_active = is_london_session or is_ny_session // FIXED:
-plotchar(killzone_active, char="K", location=location.top, color=color.blue, size=size.small, title="Killzone Active") // FIXED:
-
-
-// === MAJOR STRUCTURE DETECTION (Pivot-based, Persistent) ===
-var float[] swing_highs = array.new_float()
-var int[] swing_high_bars = array.new_int()
-var float[] swing_lows = array.new_float()
-var int[] swing_low_bars = array.new_int()
-
-is_swing_high = ta.pivothigh(high, swing_length, swing_length)
-is_swing_low = ta.pivotlow(low, swing_length, swing_length)
-
-if not na(is_swing_high)
-    array.unshift(swing_highs, is_swing_high)
-    array.unshift(swing_high_bars, bar_index - swing_length)
-if not na(is_swing_low)
-    array.unshift(swing_lows, is_swing_low)
-    array.unshift(swing_low_bars, bar_index - swing_length)
-
-// Only keep last 10 swings
-if array.size(swing_highs) > 10
-    array.pop(swing_highs)
-    array.pop(swing_high_bars)
-if array.size(swing_lows) > 10
-    array.pop(swing_lows)
-    array.pop(swing_low_bars)
-
-major_swing_high = array.size(swing_highs) > 0 ? array.get(swing_highs, 0) : na
-major_swing_low = array.size(swing_lows) > 0 ? array.get(swing_lows, 0) : na
-
-// === CHoCH & BoS DETECTION (ICT Corrected) ===
-var int choch = 0
-var int bos = 0
-var float prev_swing_high = na
-var float prev_swing_low = na
-
-// === ARRAY ACCESS SAFETY & LOGIC CORRECTION (CHoCH/BoS) === // FIXED:
-if array.size(swing_highs) > 1 and array.size(swing_lows) > 1 // FIXED:
-    prev_swing_high := array.size(swing_highs) > 1 ? array.get(swing_highs, 1) : na // FIXED:
-    prev_swing_low := array.size(swing_lows) > 1 ? array.get(swing_lows, 1) : na // FIXED:
-
-// Detect bullish CHoCH (actual break below prev swing low after making higher high) // FIXED:
-choch := (not na(prev_swing_low) and not na(prev_swing_high) and ta.crossunder(close, prev_swing_low) and high > prev_swing_high) ? 1 : 0 // FIXED:
-// Detect bullish BoS (actual break above prev swing high after higher low) // FIXED:
-bos := (not na(prev_swing_high) and not na(prev_swing_low) and ta.crossover(close, prev_swing_high) and low > prev_swing_low) ? 1 : 0 // FIXED:
+// CHANGE #toggle-choch: new input to enforce CHoCH before regime flip
+require_choch_for_flip = input.bool(true, "Require CHoCH for Bias Flip", group=grp1)
 
 
-// === FVG DETECTION (Gap-based, Robust) ===
-pip_size = syminfo.type == "forex" ? (syminfo.mintick * 10) : syminfo.mintick
-// === ARRAY ACCESS SAFETY FOR FVG === // FIXED:
-fvg_up = (bar_index > 2 and not na(low[1]) and not na(high[2]) and (low[1] > high[2]) and ((low[1] - high[2]) / pip_size >= fvg_min_pips)) // FIXED:
-fvg_dn = (bar_index > 2 and not na(high[1]) and not na(low[2]) and (high[1] < low[2]) and ((high[1] - low[2]) / pip_size >= fvg_min_pips)) // FIXED:
+// Signal Generation Controls
+grp2 = "Signal Generation"
+max_daily_signals = input.int(5, title="Max Signals Per Day", group=grp2, minval=1, maxval=20)
+cooldown_bars = input.int(10, title="Signal Cooldown (bars)", group=grp2, minval=1)
+min_confluence = input.int(4, title="Minimum Confluence Score", group=grp2, minval=2, maxval=8)
+enable_alerts = input.bool(true, title="Enable Trading Alerts", group=grp2)
+// CHANGE #debug-mode: do not fire real alerts while verifying
+debug_mode = input.bool(true, "Debug Mode (no real alerts)", group=grp2, tooltip="When ON, alerts are printed to labels/table only")
 
-// FVG fill tracking
-var float fvg_up_fill = na
-var float fvg_dn_fill = na
-fvg_up_filled = false
-fvg_dn_filled = false
-if fvg_up // FIXED:
-    fvg_up_fill := not na(high[2]) ? high[2] : na // FIXED:
-if not na(fvg_up_fill) and not na(low) and low <= fvg_up_fill // FIXED:
-    fvg_up_filled := true // FIXED:
-    fvg_up_fill := na // FIXED:
-if fvg_dn // FIXED:
-    fvg_dn_fill := not na(low[2]) ? low[2] : na // FIXED:
-if not na(fvg_dn_fill) and not na(high) and high >= fvg_dn_fill // FIXED:
-    fvg_dn_filled := true // FIXED:
-    fvg_dn_fill := na // FIXED:
+// Sessions & Killzones
+grp3 = "Sessions & Killzones"
+showKZ = input.bool(true, title="Show Killzones", group=grp3)
+// CHANGE #sessions: robust session strings (NY time)
+session_lo_str = input.session("0200-0500", "London Killzone (NYT)", group=grp3)
+session_ny_str = input.session("0730-1030", "New York Killzone (NYT)", group=grp3)
+showNy = input.bool(true, title="New York", group=grp3, inline="ny") and showKZ
+nyCss = input.color(color.new(#ff5d00, 93), title="", group=grp3, inline="ny")
+showLdno = input.bool(true, title="London Open", group=grp3, inline="lo") and showKZ
+ldnoCss = input.color(color.new(#00bcd4, 93), title="", group=grp3, inline="lo")
+// CHANGE #legacy-offset: keep for compatibility but no longer used for gating
+session_tz_offset = input.int(-5, title="Timezone Offset (legacy, unused for gating)", group=grp3, tooltip="Kept for compatibility with backgrounds only")
 
-// === LIQUIDITY SWEEPS (Equal High/Low + Reversal) ===
-liq_pip_dist = input.int(3, title="Equal High/Low Max Distance (pips)")
-eq_highs = math.abs(high - high[1]) / pip_size <= liq_pip_dist
-eq_lows = math.abs(low - low[1]) / pip_size <= liq_pip_dist
-sweep_high = eq_highs and high > high[1] and close < open
-sweep_low = eq_lows and low < low[1] and close > open
+// Fair Value Gaps
+grp4 = "Fair Value Gaps"
+shwFVG = input.bool(true, title="Show FVGs", group=grp4)
+fvg_min_pips = input.int(10, title="Min FVG Size (pips)", group=grp4, minval=1)
+visBxs = input.int(3, title="Visible FVGs", group=grp4, minval=1, maxval=10)
+cFVGbl = input.color(color.new(#00e676, 75), title="Bullish FVG", group=grp4, inline="fvgb")
+cFVGblBR = input.color(color.new(#808000, 85), title="Break", group=grp4, inline="fvgb")
+cFVGbr = input.color(color.new(#ff5252, 75), title="Bearish FVG", group=grp4, inline="fvgr")
+cFVGbrBR = input.color(color.new(#FF0000, 85), title="Break", group=grp4, inline="fvgr")
 
+// Order Blocks
+grp5 = "Order Blocks"
+showOB = input.bool(true, title="Show Order Blocks", group=grp5)
+ob_length = input.int(10, title="OB Swing Lookback", group=grp5, minval=3)
+showBull = input.int(2, title="Show Bullish OBs", group=grp5, minval=0, maxval=5)
+showBear = input.int(2, title="Show Bearish OBs", group=grp5, minval=0, maxval=5)
+useBody = input.bool(true, title="Use Candle Body", group=grp5)
+bullCss = input.color(color.new(#3e89fa, 75), title="Bullish OB", group=grp5, inline="ob1")
+bullBrkCss = input.color(color.new(#4785f9, 85), title="Break", group=grp5, inline="ob1")
+bearCss = input.color(color.new(#FF3131, 75), title="Bearish OB", group=grp5, inline="ob2")
+bearBrkCss = input.color(color.new(#f9ff57, 85), title="Break", group=grp5, inline="ob2")
 
-// === DAILY RANGE, PREMIUM, DISCOUNT ZONES (ICT Method) ===
-// Calculate at session open, not midnight
-daily_high := ta.highest(high, 24)
-daily_low := ta.lowest(low, 24)
-daily_range = daily_high - daily_low
-premium_zone := daily_low + (daily_range * 0.75)  // Upper 25%
-discount_zone := daily_low + (daily_range * 0.25) // Lower 25%
-
-// For backend variables // FIXED: removed self-assignments
-
-in_premium = close >= premium_zone
-in_discount = close <= discount_zone
-
-// === MULTI-TIMEFRAME CONFLUENCE (Robust, Manual Parsing) === // FIXED:
-var string tf1 = "60" // FIXED:
-var string tf2 = "240" // FIXED:
-var string tf3 = "1440" // FIXED:
-var int comma1 = str.indexof(tf_list, ",") // FIXED:
-var int comma2 = str.indexof(tf_list, ",", comma1 + 1) // FIXED:
-if comma1 != -1 // FIXED:
-    tf1 := str.substring(tf_list, 0, comma1) // FIXED:
-    if comma2 != -1 // FIXED:
-        tf2 := str.substring(tf_list, comma1 + 1, comma2) // FIXED:
-        tf3 := str.substring(tf_list, comma2 + 1, str.length(tf_list)) // FIXED:
-    else // FIXED:
-        tf2 := str.substring(tf_list, comma1 + 1, str.length(tf_list)) // FIXED:
-htf_bull = request.security(syminfo.tickerid, tf2, close > ta.sma(close, 20)) // FIXED:
-htf_bear = request.security(syminfo.tickerid, tf2, close < ta.sma(close, 20)) // FIXED:
-
-// === CONFLUENCE COUNT (add structure context) ===
-confluences = 0
-confluences += bos ? 1 : 0
-confluences += choch ? 1 : 0
-confluences += fvg_up or fvg_dn ? 1 : 0
-confluences += sweep_high or sweep_low ? 1 : 0
-confluences += in_premium or in_discount ? 1 : 0
-confluences += htf_bull or htf_bear ? 1 : 0
-confluences += valid_major_high or valid_major_low ? 1 : 0
+// Liquidity
+grp6 = "Liquidity"
+showLq = input.bool(true, title="Show Liquidity", group=grp6)
+liq_margin = input.float(4, title="Liquidity Margin", group=grp6, step=0.1, minval=2, maxval=7)
+visLiq = input.int(3, title="Visible Liquidity Boxes", group=grp6, minval=1, maxval=10)
+cLIQ_B = input.color(color.new(#fa451c, 75), title="Buyside", group=grp6, inline="liq")
+cLIQ_S = input.color(color.new(#1ce4fa, 75), title="Sellside", group=grp6, inline="liq")
 
 
-// === STRICT PATTERN FILTERING (ICT High-Probability Only, Robust, Array Safety) === // FIXED:
-bos_at_high = bos and not na(major_swing_high) and not na(high) and math.abs(high - major_swing_high) < syminfo.mintick * 3 // FIXED:
-choch_at_low = choch and not na(major_swing_low) and not na(low) and math.abs(low - major_swing_low) < syminfo.mintick * 3 // FIXED:
-fvg_up_strict = fvg_up and in_discount and not na(major_swing_low) and bar_index > 1 and not na(low[1]) and math.abs(low[1] - major_swing_low) < syminfo.mintick * 3 // FIXED:
-fvg_dn_strict = fvg_dn and in_premium and not na(major_swing_high) and bar_index > 1 and not na(high[1]) and math.abs(high[1] - major_swing_high) < syminfo.mintick * 3 // FIXED:
-sweep_high_strict = sweep_high and not na(major_swing_high) and not na(high) and math.abs(high - major_swing_high) < syminfo.mintick * 3 // FIXED:
-sweep_low_strict = sweep_low and not na(major_swing_low) and not na(low) and math.abs(low - major_swing_low) < syminfo.mintick * 3 // FIXED:
-in_killzone = killzone_active
-strict_confluence = confluences >= 4
+// HTF Context Gating
+htf_tf = input.string("60", title="HTF for Bias", group="Signal Generation", options=["15", "30", "60", "240", "1D"])
 
-signal_type = bos_at_high ? "BoS@High" : choch_at_low ? "CHoCH@Low" : fvg_up_strict ? "FVG Up@Low" : fvg_dn_strict ? "FVG Down@High" : sweep_high_strict ? "Sweep High@High" : sweep_low_strict ? "Sweep Low@Low" : ""
+// CHANGE #sweep-inputs: sweep window for reclose
+sweep_candles = input.int(2, "Sweep Close-back Window (bars)", group="Signal Generation", minval=1, maxval=3, tooltip="Sweep must close back inside within N bars")
 
-// === Daily signal cap and cooldown ===
+//=============================================================================
+// CORE VARIABLES
+//=============================================================================
+
+// Core calculations
+n = bar_index
+tf_msec = timeframe.in_seconds(timeframe.period) * 1000
+my_pip_size = syminfo.type == "forex" ? (syminfo.mintick * 10) : syminfo.mintick
+atr = ta.atr(14)
+// Visual window guard: show on last N bars. Use a safer definition.
+perBars = 1000
+per = bar_index >= (last_bar_index - perBars)
+maxSize = 20  // Reduced for performance
+
+
+// Displacement and volatility filters
+body_size = math.abs(close - open)
+// CHANGE #disp-relax: relax displacement per body dominance + ATR multiple
+true_range = high - low // CHANGE #disp-relax
+body_ratio_ok = true_range > 0 and (body_size / true_range) >= 0.6 // CHANGE #disp-relax
+disp_ok = body_size >= 0.5 * atr and body_ratio_ok // CHANGE #disp-relax
+is_displacement = disp_ok // CHANGE #disp-relax: preserve old name
+
+min_atr = my_pip_size * 10
+vol_ok = atr > min_atr
+
+
+// HTF Context - Replaced SMA with HTF PD mid
+// CHANGE #htf-mid: compute HTF mid from prev HTF H/L
+htf_prevH = request.security(syminfo.tickerid, htf_tf, high[1], lookahead=barmerge.lookahead_off)
+htf_prevL = request.security(syminfo.tickerid, htf_tf, low[1],  lookahead=barmerge.lookahead_off)
+htf_mid = (htf_prevH + htf_prevL) / 2.0 // CHANGE #htf-mid
+htf_bull = close > htf_mid               // CHANGE #htf-mid: preserve variable names
+htf_bear = close < htf_mid               // CHANGE #htf-mid
+
+//=============================================================================
+// ARRAY DECLARATIONS
+//=============================================================================
+
+// Order Blocks
+var bullish_ob_top = array.new<float>()
+var bullish_ob_btm = array.new<float>()
+var bullish_ob_loc = array.new<int>()
+var bullish_ob_breaker = array.new<bool>()
+
+var bearish_ob_top = array.new<float>()
+var bearish_ob_btm = array.new<float>()
+var bearish_ob_loc = array.new<int>()
+var bearish_ob_breaker = array.new<bool>()
+
+// FVGs
+var bFVG_UP_active = array.new<bool>()
+var bFVG_UP_top = array.new<float>()
+var bFVG_UP_btm = array.new<float>()
+var bFVG_UP_left = array.new<int>()
+
+var bFVG_DN_active = array.new<bool>()
+var bFVG_DN_top = array.new<float>()
+var bFVG_DN_btm = array.new<float>()
+var bFVG_DN_left = array.new<int>()
+
+// Liquidity
+var b_liq_B_top = array.new<float>()
+var b_liq_B_btm = array.new<float>()
+var b_liq_B_left = array.new<int>()
+var b_liq_B_broken = array.new<bool>()
+
+var b_liq_S_top = array.new<float>()
+var b_liq_S_btm = array.new<float>()
+var b_liq_S_left = array.new<int>()
+var b_liq_S_broken = array.new<bool>()
+
+
+
+// Market Structure
+var int MSS_dir = 0
+var pivot_highs = array.new<float>()
+var pivot_lows = array.new<float>()
+var pivot_high_bars = array.new<int>()
+var pivot_low_bars = array.new<int>()
+
+// CHANGE #structure-vars: explicit last swings + regime + events
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   regime = 0 // 1=bull, -1=bear, 0=neutral
+var bool bos_up = false
+var bool bos_down = false
+var bool choch_up = false
+var bool choch_down = false
+var bool sweep_against_short = false
+var bool sweep_against_long = false
+
+
+//=============================================================================
+// SESSION DETECTION (Replaced with input.session)
+//=============================================================================
+
+// CHANGE #sessions: robust session detection; keep names used elsewhere
+is_weekday = dayofweek(time) >= dayofweek.monday and dayofweek(time) <= dayofweek.friday
+in_lo = not na(time(timeframe.period, session_lo_str)) and is_weekday
+in_ny = not na(time(timeframe.period, session_ny_str)) and is_weekday
+is_london_session = in_lo // keep legacy var names
+is_ny_session = in_ny
+killzone_active = is_london_session or is_ny_session
+
+//=============================================================================
+// SIGNAL TRACKING
+//=============================================================================
+
 var int signal_count_today = 0
 var int last_signal_bar = na
+
+
+//=============================================================================
+// UTILITY FUNCTIONS
+//=============================================================================
+
+calculate_confluence() =>
+    // CHANGE #legacy-confluence: retained for backwards-compat table; now returns max(bull, bear)
+    int score = 0
+
+    // Market Structure (legacy, neutral)
+    if MSS_dir == 1
+        score += 1
+    if MSS_dir == -1
+        score += 1
+
+    // FVG presence
+    has_active_fvg_up = false
+    has_active_fvg_dn = false
+
+    if array.size(bFVG_UP_active) > 0
+        for i = 0 to math.min(2, array.size(bFVG_UP_active) - 1)
+            if array.get(bFVG_UP_active, i)
+                has_active_fvg_up := true
+                break
+
+    if array.size(bFVG_DN_active) > 0
+        for i = 0 to math.min(2, array.size(bFVG_DN_active) - 1)
+            if array.get(bFVG_DN_active, i)
+                has_active_fvg_dn := true
+                break
+
+    if has_active_fvg_up or has_active_fvg_dn
+        score += 1
+
+    // Order Block presence
+    if array.size(bullish_ob_top) > 0 or array.size(bearish_ob_top) > 0
+        score += 1
+
+    // Liquidity presence
+    if array.size(b_liq_B_top) > 0
+        score += 1
+
+    if array.size(b_liq_S_top) > 0
+        score += 1
+
+    // Killzone timing
+    if killzone_active
+        score += 1
+
+    // CHANGE #pd-mid: use prior-day PD mid instead of "24 bars"
+    prevD_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+    prevD_low  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+    prevD_mid  = (prevD_high + prevD_low) / 2.0
+    in_premium = close >= prevD_mid
+    in_discount = close <= prevD_mid
+
+    if in_premium or in_discount
+        score += 1
+
+    score
+
+// CHANGE #side-confluence: side-aware scoring per your rules
+// Sweep detection flags (safe guarded assignment)
+if array.size(b_liq_S_btm) > 0
+    sweep_against_long := (low < array.get(b_liq_S_btm, 0) and close > array.get(b_liq_S_btm, 0))
+else
+    sweep_against_long := false
+
+if array.size(b_liq_B_top) > 0
+    sweep_against_short := (high > array.get(b_liq_B_top, 0) and close < array.get(b_liq_B_top, 0))
+else
+    sweep_against_short := false
+
+confluence_for_side(isLong) =>
+    int s = 0
+    // HTF alignment via mid
+    if (isLong and htf_bull) or ((not isLong) and htf_bear)
+        s += 1
+
+    // Structure events
+    if isLong
+        if regime == 1 or choch_up or bos_up
+            s += 1
+    else
+        if regime == -1 or choch_down or bos_down
+            s += 1
+
+    // Active FVG alignment
+    has_up_fvg = array.size(bFVG_UP_active) > 0 and array.get(bFVG_UP_active, 0)
+    has_dn_fvg = array.size(bFVG_DN_active) > 0 and array.get(bFVG_DN_active, 0)
+    if (isLong and has_up_fvg) or ((not isLong) and has_dn_fvg)
+        s += 1
+
+    // OB presence alignment
+    if isLong and array.size(bullish_ob_top) > 0
+        s += 1
+    if not isLong and array.size(bearish_ob_top) > 0
+        s += 1
+
+    // PD mid alignment (prior-day)
+    prevD_high_ = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+    prevD_low_  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+    prevD_mid_  = (prevD_high_ + prevD_low_) / 2.0
+    in_premium_ = close >= prevD_mid_
+    in_discount_ = close <= prevD_mid_
+    if (isLong and in_discount_) or ((not isLong) and in_premium_)
+        s += 1
+
+    // Sweep alignment: want sweep against direction before entry
+    if isLong
+        if nz(sweep_against_long, false)
+            s += 1
+    else
+        if nz(sweep_against_short, false)
+            s += 1
+
+    // Killzone
+    if killzone_active
+        s += 1
+
+    // Volatility/Displacement
+    if vol_ok and is_displacement
+        s += 1
+
+    s
+
+//=============================================================================
+// MARKET STRUCTURE DETECTION
+//=============================================================================
+
+// Simplified pivot detection
+ph = ta.pivothigh(high, swing_length, 1)
+pl = ta.pivotlow(low, swing_length, 1)
+
+if not na(ph)
+    array.unshift(pivot_highs, ph)
+    array.unshift(pivot_high_bars, bar_index[1])
+    if array.size(pivot_highs) > 5
+        array.pop(pivot_highs)
+        array.pop(pivot_high_bars)
+
+if not na(pl)
+    array.unshift(pivot_lows, pl)
+    array.unshift(pivot_low_bars, bar_index[1])
+    if array.size(pivot_lows) > 5
+        array.pop(pivot_lows)
+        array.pop(pivot_low_bars)
+
+
+// Market Structure Direction (legacy trend-ish for display only)
+if array.size(pivot_highs) >= 2 and array.size(pivot_lows) >= 2
+    recent_high = array.get(pivot_highs, 0)
+    prev_high = array.get(pivot_highs, 1)
+    recent_low = array.get(pivot_lows, 0)
+    prev_low = array.get(pivot_lows, 1)
+
+    if recent_high > prev_high and recent_low > prev_low
+        MSS_dir := 1  // Bullish
+    else if recent_high < prev_high and recent_low < prev_low
+        MSS_dir := -1  // Bearish
+
+// CHANGE #structure-events: update last swings and detect BOS/CHoCH
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+bos_up := not na(lastSwingHigh) and close > lastSwingHigh
+bos_down := not na(lastSwingLow) and close < lastSwingLow
+
+choch_up := regime == -1 and bos_up
+choch_down := regime == 1 and bos_down
+
+// Regime update
+if require_choch_for_flip
+    if choch_up
+        regime := 1
+    else if choch_down
+        regime := -1
+else
+    if choch_up or bos_up
+        regime := 1
+    else if choch_down or bos_down
+        regime := -1
+
+// Optional plotting for structure events
+plotshape(iBOS and bos_up,   title="BOS ↑", style=shape.triangleup,   location=location.belowbar, color=cBOSbl, size=size.tiny, text="BOS↑")
+plotshape(iBOS and bos_down, title="BOS ↓", style=shape.triangledown, location=location.abovebar, color=cBOSbr, size=size.tiny, text="BOS↓")
+plotshape(iMSS and choch_up,   title="CHoCH ↑", style=shape.labelup,   location=location.belowbar, color=cMSSbl, size=size.tiny, text="CHoCH↑")
+plotshape(iMSS and choch_down, title="CHoCH ↓", style=shape.labeldown, location=location.abovebar, color=cMSSbr, size=size.tiny, text="CHoCH↓")
+
+//=============================================================================
+// FAIR VALUE GAPS (mid-point mitigation + idempotent drawing)
+//=============================================================================
+
+// Initialize FVG arrays
+if barstate.isfirst
+    for i = 0 to visBxs - 1
+        array.push(bFVG_UP_active, false)
+        array.push(bFVG_UP_top, na)
+        array.push(bFVG_UP_btm, na)
+        array.push(bFVG_UP_left, na)
+        array.push(bFVG_DN_active, false)
+        array.push(bFVG_DN_top, na)
+        array.push(bFVG_DN_btm, na)
+        array.push(bFVG_DN_left, na)
+
+// CHANGE #fvg-draw-ids: track box IDs to avoid leaks
+var boxes_fvg_up = array.new_box()
+var boxes_fvg_dn = array.new_box()
+
+// FVG Detection (relaxed displacement already handled by is_displacement gates later)
+body = math.abs(close - open)
+meanBody = ta.sma(body, swing_length)
+L_body = high - math.max(close, open) < body * 0.36 and math.min(close, open) - low < body * 0.36
+L_bodyUP = body > meanBody and L_body and close > open
+L_bodyDN = body > meanBody and L_body and close < open
+
+imbalanceUP = L_bodyUP[1] and low > high[2] and ((low - high[2]) / my_pip_size >= fvg_min_pips)
+imbalanceDN = L_bodyDN[1] and high < low[2] and ((low[2] - high) / my_pip_size >= fvg_min_pips)
+
+// Create FVGs
+if imbalanceUP and per and shwFVG
+    array.unshift(bFVG_UP_active, true)
+    array.unshift(bFVG_UP_top, high[2])
+    array.unshift(bFVG_UP_btm, low)
+    array.unshift(bFVG_UP_left, n-2)
+    while array.size(bFVG_UP_active) > visBxs
+        array.pop(bFVG_UP_active)
+        array.pop(bFVG_UP_top)
+        array.pop(bFVG_UP_btm)
+        array.pop(bFVG_UP_left)
+    // CHANGE #fvg-box-create
+    b = box.new(n-2, high[2], n, low, bgcolor=cFVGbl, border_color=color.new(color.white, 100), xloc=xloc.bar_index)
+    array.unshift(boxes_fvg_up, b)
+    if array.size(boxes_fvg_up) > visBxs
+        box.delete(array.pop(boxes_fvg_up))
+
+if imbalanceDN and per and shwFVG
+    array.unshift(bFVG_DN_active, true)
+    array.unshift(bFVG_DN_top, high)
+    array.unshift(bFVG_DN_btm, low[2])
+    array.unshift(bFVG_DN_left, n-2)
+    while array.size(bFVG_DN_active) > visBxs
+        array.pop(bFVG_DN_active)
+        array.pop(bFVG_DN_top)
+        array.pop(bFVG_DN_btm)
+        array.pop(bFVG_DN_left)
+    // CHANGE #fvg-box-create
+    b2 = box.new(n-2, high, n, low[2], bgcolor=cFVGbr, border_color=color.new(color.white, 100), xloc=xloc.bar_index)
+    array.unshift(boxes_fvg_dn, b2)
+    if array.size(boxes_fvg_dn) > visBxs
+        box.delete(array.pop(boxes_fvg_dn))
+
+// CHANGE #fvg-mitigate-mid: consider mitigated at 50%
+fvg_mid_up(idx) =>
+    top = array.get(bFVG_UP_top, idx)
+    btm = array.get(bFVG_UP_btm, idx)
+    (top + btm) / 2.0
+
+fvg_mid_dn(idx) =>
+    top = array.get(bFVG_DN_top, idx)
+    btm = array.get(bFVG_DN_btm, idx)
+    (top + btm) / 2.0
+
+// Update active state by mid fill; update boxes idempotently
+if array.size(bFVG_UP_active) > 0
+    for i = 0 to math.min(visBxs - 1, array.size(bFVG_UP_active) - 1)
+        if array.get(bFVG_UP_active, i)
+            midv = fvg_mid_up(i)
+            if not na(midv) and low <= midv
+                array.set(bFVG_UP_active, i, false)
+        // Update box right edge + color
+        if i < array.size(boxes_fvg_up)
+            bx = array.get(boxes_fvg_up, i)
+            if not na(bx)
+                box.set_right(bx, bar_index)
+                active = array.get(bFVG_UP_active, i)
+                box.set_bgcolor(bx, active ? cFVGbl : cFVGblBR)
+
+if array.size(bFVG_DN_active) > 0
+    for i = 0 to math.min(visBxs - 1, array.size(bFVG_DN_active) - 1)
+        if array.get(bFVG_DN_active, i)
+            midv2 = fvg_mid_dn(i)
+            if not na(midv2) and high >= midv2
+                array.set(bFVG_DN_active, i, false)
+        if i < array.size(boxes_fvg_dn)
+            bx2 = array.get(boxes_fvg_dn, i)
+            if not na(bx2)
+                box.set_right(bx2, bar_index)
+                active2 = array.get(bFVG_DN_active, i)
+                box.set_bgcolor(bx2, active2 ? cFVGbr : cFVGbrBR)
+
+//=============================================================================
+// ORDER BLOCKS (Simplified + idempotent drawing)
+//=============================================================================
+
+// CHANGE #ob-draw-ids
+var boxes_ob_bull = array.new_box()
+var boxes_ob_bear = array.new_box()
+
+if not na(ph) and showOB and per
+    // Bullish OB on new high
+    if array.size(pivot_highs) > 1 and ph > array.get(pivot_highs, 1)
+        ob_high = useBody ? math.max(close[1], open[1]) : high[1]
+        ob_low = useBody ? math.min(close[1], open[1]) : low[1]
+        array.unshift(bullish_ob_top, ob_high)
+        array.unshift(bullish_ob_btm, ob_low)
+        array.unshift(bullish_ob_loc, time[1])
+        array.unshift(bullish_ob_breaker, false)
+        while array.size(bullish_ob_top) > showBull
+            array.pop(bullish_ob_top)
+            array.pop(bullish_ob_btm)
+            array.pop(bullish_ob_loc)
+            array.pop(bullish_ob_breaker)
+        // CHANGE #ob-box-create
+        b = box.new(time[1], ob_high, time + tf_msec * 2, ob_low, xloc=xloc.bar_time, bgcolor=bullCss, border_color=color.new(color.white, 100))
+        array.unshift(boxes_ob_bull, b)
+        if array.size(boxes_ob_bull) > showBull
+            box.delete(array.pop(boxes_ob_bull))
+
+if not na(pl) and showOB and per
+    // Bearish OB on new low
+    if array.size(pivot_lows) > 1 and pl < array.get(pivot_lows, 1)
+        ob_high = useBody ? math.max(close[1], open[1]) : high[1]
+        ob_low = useBody ? math.min(close[1], open[1]) : low[1]
+        array.unshift(bearish_ob_top, ob_high)
+        array.unshift(bearish_ob_btm, ob_low)
+        array.unshift(bearish_ob_loc, time[1])
+        array.unshift(bearish_ob_breaker, false)
+        while array.size(bearish_ob_top) > showBear
+            array.pop(bearish_ob_top)
+            array.pop(bearish_ob_btm)
+            array.pop(bearish_ob_loc)
+            array.pop(bearish_ob_breaker)
+        // CHANGE #ob-box-create
+        b2 = box.new(time[1], ob_high, time + tf_msec * 2, ob_low, xloc=xloc.bar_time, bgcolor=bearCss, border_color=color.new(color.white, 100))
+        array.unshift(boxes_ob_bear, b2)
+        if array.size(boxes_ob_bear) > showBear
+            box.delete(array.pop(boxes_ob_bear))
+
+// Order Block Break Detection + box color update
+if array.size(bullish_ob_top) > 0
+    for i = 0 to array.size(bullish_ob_top) - 1 by 1
+        if not array.get(bullish_ob_breaker, i)
+            ob_btm = array.get(bullish_ob_btm, i)
+            if not na(ob_btm) and math.min(close, open) < ob_btm
+                array.set(bullish_ob_breaker, i, true)
+        if i < array.size(boxes_ob_bull)
+            bx = array.get(boxes_ob_bull, i)
+            if not na(bx)
+                box.set_right(bx, time) // extend
+                box.set_bgcolor(bx, array.get(bullish_ob_breaker, i) ? bullBrkCss : bullCss)
+
+if array.size(bearish_ob_top) > 0
+    for i = 0 to array.size(bearish_ob_top) - 1 by 1
+        if not array.get(bearish_ob_breaker, i)
+            ob_top = array.get(bearish_ob_top, i)
+            if not na(ob_top) and math.max(close, open) > ob_top
+                array.set(bearish_ob_breaker, i, true)
+        if i < array.size(boxes_ob_bear)
+            bx2 = array.get(boxes_ob_bear, i)
+            if not na(bx2)
+                box.set_right(bx2, time)
+                box.set_bgcolor(bx2, array.get(bearish_ob_breaker, i) ? bearBrkCss : bearCss)
+
+//=============================================================================
+// LIQUIDITY DETECTION (Simplified + idempotent drawing + sweeps)
+//=============================================================================
+
+// CHANGE #liq-draw-ids
+var boxes_liq_b = array.new_box()
+var boxes_liq_s = array.new_box()
+
+if not na(ph) and showLq and per
+    // Check for multiple highs around similar levels
+    similar_count = 0
+    if array.size(pivot_highs) > 0
+        for i = 0 to math.min(4, array.size(pivot_highs) - 1)
+            ph_val = array.get(pivot_highs, i)
+            if not na(ph_val) and math.abs(ph_val - ph) < (atr / liq_margin)
+                similar_count += 1
+
+    if similar_count >= 2
+        array.unshift(b_liq_B_top, ph + (atr/liq_margin))
+        array.unshift(b_liq_B_btm, ph - (atr/liq_margin))
+        array.unshift(b_liq_B_left, bar_index - 5)
+        array.unshift(b_liq_B_broken, false)
+
+        while array.size(b_liq_B_top) > visLiq
+            array.pop(b_liq_B_top)
+            array.pop(b_liq_B_btm)
+            array.pop(b_liq_B_left)
+            array.pop(b_liq_B_broken)
+
+        // CHANGE #liq-box-create
+        b = box.new(bar_index - 5, ph + (atr/liq_margin), bar_index + 10, ph - (atr/liq_margin), xloc=xloc.bar_index, bgcolor=cLIQ_B, border_color=color.new(color.white, 100))
+        array.unshift(boxes_liq_b, b)
+        if array.size(boxes_liq_b) > visLiq
+            box.delete(array.pop(boxes_liq_b))
+
+if not na(pl) and showLq and per
+    // Check for multiple lows around similar levels
+    similar_count = 0
+    if array.size(pivot_lows) > 0
+        for i = 0 to math.min(4, array.size(pivot_lows) - 1)
+            pl_val = array.get(pivot_lows, i)
+            if not na(pl_val) and math.abs(pl_val - pl) < (atr / liq_margin)
+                similar_count += 1
+
+    if similar_count >= 2
+        array.unshift(b_liq_S_top, pl + (atr/liq_margin))
+        array.unshift(b_liq_S_btm, pl - (atr/liq_margin))
+        array.unshift(b_liq_S_left, bar_index - 5)
+        array.unshift(b_liq_S_broken, false)
+
+        while array.size(b_liq_S_top) > visLiq
+            array.pop(b_liq_S_top)
+            array.pop(b_liq_S_btm)
+            array.pop(b_liq_S_left)
+            array.pop(b_liq_S_broken)
+
+        // CHANGE #liq-box-create
+        b2 = box.new(bar_index - 5, pl + (atr/liq_margin), bar_index + 10, pl - (atr/liq_margin), xloc=xloc.bar_index, bgcolor=cLIQ_S, border_color=color.new(color.white, 100))
+        array.unshift(boxes_liq_s, b2)
+        if array.size(boxes_liq_s) > visLiq
+            box.delete(array.pop(boxes_liq_s))
+
+// Liquidity Break Detection + box color updates
+if array.size(b_liq_B_top) > 0
+    for i = 0 to array.size(b_liq_B_top) - 1 by 1
+        if not array.get(b_liq_B_broken, i)
+            liq_top = array.get(b_liq_B_top, i)
+            if not na(liq_top) and high > liq_top
+                array.set(b_liq_B_broken, i, true)
+        if i < array.size(boxes_liq_b)
+            bx = array.get(boxes_liq_b, i)
+            if not na(bx)
+                box.set_right(bx, bar_index + 10)
+                box.set_bgcolor(bx, array.get(b_liq_B_broken, i) ? color.new(cLIQ_B, 90) : cLIQ_B)
+
+if array.size(b_liq_S_top) > 0
+    for i = 0 to array.size(b_liq_S_top) - 1 by 1
+        if not array.get(b_liq_S_broken, i)
+            liq_btm = array.get(b_liq_S_btm, i)
+            if not na(liq_btm) and low < liq_btm
+                array.set(b_liq_S_broken, i, true)
+        if i < array.size(boxes_liq_s)
+            bx2 = array.get(boxes_liq_s, i)
+            if not na(bx2)
+                box.set_right(bx2, bar_index + 10)
+                box.set_bgcolor(bx2, array.get(b_liq_S_broken, i) ? color.new(cLIQ_S, 90) : cLIQ_S)
+
+//=============================================================================
+// SWEEP DETECTION (explicit, within N candles)  -- SAFE guarded version
+//=============================================================================
+
+// Get the most-recent liquidity reference values safely (avoid array.get on empty arrays)
+// SAFE: get most-recent liquidity reference values (typed declarations)
+float liq_b_top = na
+float liq_s_btm = na
+if array.size(b_liq_B_top) > 0
+    liq_b_top := array.get(b_liq_B_top, 0)
+if array.size(b_liq_S_btm) > 0
+    liq_s_btm := array.get(b_liq_S_btm, 0)
+
+// Compute sweep NOW / PREV flags using the safe local values
+bool bsl_sweep_now  = not na(liq_b_top) and (high  > liq_b_top and close  < liq_b_top)   // buyside sweep (for SHORTs)
+bool bsl_sweep_prev = not na(liq_b_top) and (high[1] > liq_b_top and close[1] < liq_b_top)
+
+bool ssl_sweep_now  = not na(liq_s_btm) and (low  < liq_s_btm and close  > liq_s_btm)   // sellside sweep (for LONGs)
+bool ssl_sweep_prev = not na(liq_s_btm) and (low[1] < liq_s_btm and close[1] > liq_s_btm)
+
+// Update the global sweep flags (these should be declared once as `var bool` earlier)
+sweep_against_short := bsl_sweep_now or (sweep_candles >= 2 and bsl_sweep_prev)
+sweep_against_long  := ssl_sweep_now or (sweep_candles >= 2 and ssl_sweep_prev)
+
+
+//=============================================================================
+// PRIOR-DAY PD MID (global for gating & plots)
+//=============================================================================
+
+// CHANGE #pd-mid-global
+prevD_high_g = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+prevD_low_g  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+prevD_mid_g  = (prevD_high_g + prevD_low_g) / 2.0
+in_premium_g = close >= prevD_mid_g
+in_discount_g = close <= prevD_mid_g
+
+//=============================================================================
+// RETRACEMENT ENTRY CONDITIONS (FVG mid + OB open close-inside)
+//=============================================================================
+
+// Long retrace into active bullish FVG (close inside near/above mid)
+var bool long_retrace = false
+var bool short_retrace = false
+
+long_retrace := false
+if array.size(bFVG_UP_active) > 0 and array.get(bFVG_UP_active, 0)
+    fvg_top = array.get(bFVG_UP_top, 0)
+    fvg_btm = array.get(bFVG_UP_btm, 0)
+    fvg_mid0 = (fvg_top + fvg_btm) / 2.0
+    long_retrace := low <= fvg_top and close >= fvg_mid0 and close <= fvg_top
+
+// Short retrace into active bearish FVG (close inside near/below mid)
+short_retrace := false
+if array.size(bFVG_DN_active) > 0 and array.get(bFVG_DN_active, 0)
+    fvg_top2 = array.get(bFVG_DN_top, 0)
+    fvg_btm2 = array.get(bFVG_DN_btm, 0)
+    fvg_mid1 = (fvg_top2 + fvg_btm2) / 2.0
+    short_retrace := high >= fvg_btm2 and close <= fvg_mid1 and close >= fvg_btm2
+
+// OB open approximations (use zone bounds + small buffer)
+tick = syminfo.mintick
+buff = ob_open_buffer_ticks * tick
+
+// Long: OB is bullish zone [btm..top]; require close inside zone, near lower half as proxy for OB open (refined wick optional by your discretion)
+long_ob_tap = false
+if array.size(bullish_ob_top) > 0
+    ob_t = array.get(bullish_ob_top, 0)
+    ob_b = array.get(bullish_ob_btm, 0)
+    long_ob_tap := close <= ob_t and close >= ob_b and low <= (ob_b + buff)
+
+// Short: OB is bearish zone [btm..top]; require close inside zone, near upper half
+short_ob_tap = false
+if array.size(bearish_ob_top) > 0
+    ob_t2 = array.get(bearish_ob_top, 0)
+    ob_b2 = array.get(bearish_ob_btm, 0)
+    short_ob_tap := close <= ob_t2 and close >= ob_b2 and high >= (ob_t2 - buff)
+
+//=============================================================================
+// ORDER BLOCKS (Simplified)
+//=============================================================================
+
+if not na(ph) and showOB and per
+    // Bullish OB on new high
+    if array.size(pivot_highs) > 1 and ph > array.get(pivot_highs, 1)
+        ob_high = useBody ? math.max(close[1], open[1]) : high[1]
+        ob_low = useBody ? math.min(close[1], open[1]) : low[1]
+        
+        array.unshift(bullish_ob_top, ob_high)
+        array.unshift(bullish_ob_btm, ob_low)
+        array.unshift(bullish_ob_loc, time[1])
+        array.unshift(bullish_ob_breaker, false)
+        
+        while array.size(bullish_ob_top) > showBull
+            array.pop(bullish_ob_top)
+            array.pop(bullish_ob_btm)
+            array.pop(bullish_ob_loc)
+            array.pop(bullish_ob_breaker)
+
+if not na(pl) and showOB and per
+    // Bearish OB on new low
+    if array.size(pivot_lows) > 1 and pl < array.get(pivot_lows, 1)
+        ob_high = useBody ? math.max(close[1], open[1]) : high[1]
+        ob_low = useBody ? math.min(close[1], open[1]) : low[1]
+        
+        array.unshift(bearish_ob_top, ob_high)
+        array.unshift(bearish_ob_btm, ob_low)
+        array.unshift(bearish_ob_loc, time[1])
+        array.unshift(bearish_ob_breaker, false)
+        
+        while array.size(bearish_ob_top) > showBear
+            array.pop(bearish_ob_top)
+            array.pop(bearish_ob_btm)
+            array.pop(bearish_ob_loc)
+            array.pop(bearish_ob_breaker)
+
+// Order Block Break Detection
+if array.size(bullish_ob_top) > 0
+    for i = 0 to array.size(bullish_ob_top) - 1 by 1
+        if not array.get(bullish_ob_breaker, i)
+            ob_btm = array.get(bullish_ob_btm, i)
+            if not na(ob_btm) and math.min(close, open) < ob_btm
+                array.set(bullish_ob_breaker, i, true)
+
+if array.size(bearish_ob_top) > 0
+    for i = 0 to array.size(bearish_ob_top) - 1 by 1
+        if not array.get(bearish_ob_breaker, i)
+            ob_top = array.get(bearish_ob_top, i)
+            if not na(ob_top) and math.max(close, open) > ob_top
+                array.set(bearish_ob_breaker, i, true)
+
+//=============================================================================
+// LIQUIDITY DETECTION (Simplified)
+//=============================================================================
+
+if not na(ph) and showLq and per
+    // Check for multiple highs around similar levels
+    similar_count = 0
+    if array.size(pivot_highs) > 0
+        for i = 0 to math.min(4, array.size(pivot_highs) - 1)
+            ph_val = array.get(pivot_highs, i)
+            if not na(ph_val) and math.abs(ph_val - ph) < (atr / liq_margin)
+                similar_count += 1
+    
+    if similar_count >= 2
+        array.unshift(b_liq_B_top, ph + (atr/liq_margin))
+        array.unshift(b_liq_B_btm, ph - (atr/liq_margin))
+        array.unshift(b_liq_B_left, bar_index - 5)
+        array.unshift(b_liq_B_broken, false)
+        
+        while array.size(b_liq_B_top) > visLiq
+            array.pop(b_liq_B_top)
+            array.pop(b_liq_B_btm)
+            array.pop(b_liq_B_left)
+            array.pop(b_liq_B_broken)
+
+if not na(pl) and showLq and per
+    // Check for multiple lows around similar levels
+    similar_count = 0
+    if array.size(pivot_lows) > 0
+        for i = 0 to math.min(4, array.size(pivot_lows) - 1)
+            pl_val = array.get(pivot_lows, i)
+            if not na(pl_val) and math.abs(pl_val - pl) < (atr / liq_margin)
+                similar_count += 1
+    
+    if similar_count >= 2
+        array.unshift(b_liq_S_top, pl + (atr/liq_margin))
+        array.unshift(b_liq_S_btm, pl - (atr/liq_margin))
+        array.unshift(b_liq_S_left, bar_index - 5)
+        array.unshift(b_liq_S_broken, false)
+        
+        while array.size(b_liq_S_top) > visLiq
+            array.pop(b_liq_S_top)
+            array.pop(b_liq_S_btm)
+            array.pop(b_liq_S_left)
+            array.pop(b_liq_S_broken)
+
+// Liquidity Break Detection
+if array.size(b_liq_B_top) > 0
+    for i = 0 to array.size(b_liq_B_top) - 1 by 1
+        if not array.get(b_liq_B_broken, i)
+            liq_top = array.get(b_liq_B_top, i)
+            if not na(liq_top) and high > liq_top
+                array.set(b_liq_B_broken, i, true)
+
+if array.size(b_liq_S_top) > 0
+    for i = 0 to array.size(b_liq_S_top) - 1 by 1
+        if not array.get(b_liq_S_broken, i)
+            liq_btm = array.get(b_liq_S_btm, i)
+            if not na(liq_btm) and low < liq_btm
+                array.set(b_liq_S_broken, i, true)
+
+
+//=============================================================================
+// SIGNAL GENERATION (side-aware confluence + sweep + session + HTF mid)
+//=============================================================================
+
+// Daily signal reset
 new_day = ta.change(time("D")) != 0
 if new_day
     signal_count_today := 0
-can_signal = (signal_count_today < max_daily_signals)
+
+// Side-aware scores
+bullScore = confluence_for_side(true)
+bearScore = confluence_for_side(false)
+
+// Legacy aggregate for table compatibility
+confluence_score = math.max(bullScore, bearScore)
+
+// Signal validation
+can_signal = signal_count_today < max_daily_signals
 cooldown_ok = na(last_signal_bar) or (bar_index - last_signal_bar > cooldown_bars)
-should_alert = signal_type != "" and in_killzone and strict_confluence and can_signal and cooldown_ok
-if should_alert
+bull_ok = (regime == 1 or choch_up) and htf_bull and killzone_active and vol_ok and bullScore >= min_confluence
+bear_ok = (regime == -1 or choch_down) and htf_bear and killzone_active and vol_ok and bearScore >= min_confluence
+
+// Strict entry gates: require sweep + retrace into zone with close inside
+should_alert_buy = bull_ok and (sweep_against_long) and (long_retrace or long_ob_tap) and can_signal and cooldown_ok
+should_alert_sell = bear_ok and (sweep_against_short) and (short_retrace or short_ob_tap) and can_signal and cooldown_ok
+
+// TP/SL heuristics
+stop_loss_buy = array.size(bullish_ob_btm) > 0 ? array.get(bullish_ob_btm, 0) : low
+stop_loss_sell = array.size(bearish_ob_top) > 0 ? array.get(bearish_ob_top, 0) : high
+take_profit_buy = close + (close - stop_loss_buy) * 2
+take_profit_sell = close - (stop_loss_sell - close) * 2
+
+//=============================================================================
+// JSON ALERTS + DEBUG
+//=============================================================================
+
+// CHANGE #alertcondition: keep UI-based alert options
+alertcondition(true, title="BUY Signal (JSON)", message="JSON in runtime alert")
+alertcondition(true, title="SELL Signal (JSON)", message="JSON in runtime alert")
+
+make_json(side, score, entry, sl, tp, sessionName, htf_mid_val) => '{' + '"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","side":"' + side + '","score":' + str.tostring(score) + ',"entry":' + str.tostring(entry) + ',"sl":' + str.tostring(sl) + ',"tp":' + str.tostring(tp) + ',"session":"' + sessionName + '","htf_mid":' + str.tostring(htf_mid_val) + ',"regime":' + str.tostring(regime) + ',"choch_up":' + str.tostring(choch_up ? 1 : 0) + ',"choch_down":' + str.tostring(choch_down ? 1 : 0) + ',"bos_up":' + str.tostring(bos_up ? 1 : 0) + ',"bos_down":' + str.tostring(bos_down ? 1 : 0) + '}'
+
+
+session_text = is_london_session ? "LONDON" : is_ny_session ? "NEW_YORK" : "OTHER"
+
+// CHANGE #debug-labels: show JSON as label/table when debug_mode
+if should_alert_buy
     signal_count_today += 1
     last_signal_bar := bar_index
+    json_alert = make_json("BUY", bullScore, close, stop_loss_buy, take_profit_buy, session_text, htf_mid)
+    if debug_mode
+        label.new(bar_index, low, "🟢 BUY\n" + json_alert, style=label.style_label_up, color=color.lime, textcolor=color.white, size=size.normal)
+    else
+        if enable_alerts
+            alert(json_alert, alert.freq_once_per_bar)
 
-confidence = math.min(100, 70 + confluences * 5)
+if should_alert_sell
+    signal_count_today += 1
+    last_signal_bar := bar_index
+    json_alert = make_json("SELL", bearScore, close, stop_loss_sell, take_profit_sell, session_text, htf_mid)
+    if debug_mode
+        label.new(bar_index, high, "🔴 SELL\n" + json_alert, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+    else
+        if enable_alerts
+            alert(json_alert, alert.freq_once_per_bar)
 
-// === STOP LOSS / TAKE PROFIT SUGGESTIONS (Array Safety) === // FIXED:
-sl = bos or choch ? low : (fvg_up and bar_index > 1 and not na(low[1])) ? low[1] : (fvg_dn and bar_index > 1 and not na(high[1])) ? high[1] : sweep_high ? low : sweep_low ? high : na // FIXED:
-tp = bos or choch ? high : (fvg_up and bar_index > 1 and not na(high[1])) ? high[1] : (fvg_dn and bar_index > 1 and not na(low[1])) ? low[1] : sweep_high ? high : sweep_low ? low : na // FIXED:
 
+// Toggle to use legacy redraws (default OFF)
+use_legacy_redraw = input.bool(false, "Use Legacy Redraw (barstate.islast)", group="Sessions & Killzones")
 
-// === BACKEND VARIABLE ASSIGNMENTS (Integration) === // FIXED:
-high_prob_buy := should_alert and (bos_at_high or fvg_up_strict or sweep_low_strict) // FIXED:
-high_prob_sell := should_alert and (choch_at_low or fvg_dn_strict or sweep_high_strict) // FIXED:
-entry_price := should_alert ? close : na // FIXED:
-stop_loss := should_alert ? sl : na // FIXED:
-take_profit := should_alert ? tp : na // FIXED:
-setup_type := should_alert ? signal_type : "" // FIXED:
+// DIAGNOSTIC VISUALS — remove after confirming
+if barstate.islast
+    label.new(bar_index, high, "VIS OK", style=label.style_label_down, color=color.new(color.blue, 0), textcolor=color.white, size=size.tiny)
+    box.new(bar_index - 20, high, bar_index - 10, high - (atr * 0.2), xloc=xloc.bar_index, bgcolor=color.new(color.blue, 80), border_color=color.new(color.blue, 0))
 
-// === ALERT PAYLOAD (Expanded, with structure context) ===
-alert_json = '{'
-    + '"symbol":"' + syminfo.ticker + '",'
-    + '"timeframe":"' + timeframe.period + '",'
-    + '"signal_type":"' + signal_type + '",'
-    + '"confidence":' + str.tostring(confidence) + ','
-    + '"timestamp":' + str.tostring(time) + ','
-    + '"price_data":{' + '"open":' + str.tostring(open) + ',"high":' + str.tostring(high) + ',"low":' + str.tostring(low) + ',"close":' + str.tostring(close) + '},'
-    + '"sl":' + str.tostring(sl) + ','
-    + '"tp":' + str.tostring(tp) + ','
-    + '"multi_tf":{' + '"htf_bull":' + str.tostring(htf_bull) + ',"htf_bear":' + str.tostring(htf_bear) + '},'
-    + '"structure":{' + '"major_swing_high":' + str.tostring(major_swing_high) + ',"major_swing_low":' + str.tostring(major_swing_low) + ',"key_resistance":' + str.tostring(key_resistance) + ',"key_support":' + str.tostring(key_support) + ',"valid_major_high":' + str.tostring(valid_major_high) + ',"valid_major_low":' + str.tostring(valid_major_low) + '},'
-    + '"backend":{' // FIXED:
-        + '"high_prob_buy":' + str.tostring(high_prob_buy) + ',' // FIXED:
-        + '"high_prob_sell":' + str.tostring(high_prob_sell) + ',' // FIXED:
-        + '"entry_price":' + str.tostring(entry_price) + ',' // FIXED:
-        + '"stop_loss":' + str.tostring(stop_loss) + ',' // FIXED:
-        + '"take_profit":' + str.tostring(take_profit) + ',' // FIXED:
-        + '"setup_type":"' + setup_type + '"' // FIXED:
-    + '},' // FIXED:
-    + '"confluences":{' + '"bos":' + str.tostring(bos) + ',"choch":' + str.tostring(choch) + ',"fvg_up":' + str.tostring(fvg_up) + ',"fvg_dn":' + str.tostring(fvg_dn) + ',"fvg_up_filled":' + str.tostring(fvg_up_filled) + ',"fvg_dn_filled":' + str.tostring(fvg_dn_filled) + ',"sweep_high":' + str.tostring(sweep_high) + ',"sweep_low":' + str.tostring(sweep_low) + ',"in_premium":' + str.tostring(in_premium) + ',"in_discount":' + str.tostring(in_discount) + '}'
-    + '}'
+if barstate.islast and use_legacy_redraw
+    // Legacy redraws for OB/FVG/LIQ are disabled by default. Enable use_legacy_redraw to use them.
+    // ...existing code for info table and backgrounds remains...
 
-// === ALERT ===
-alertcondition(should_alert, title="ICT High-Quality Signal", message=alert_json)
+//=============================================================================
+// SESSION BACKGROUNDS
+//=============================================================================
 
-// === CHART LABELS (add structure context, robust, Array Safety) === // FIXED:
-if bos and not na(high) // FIXED:
-    label.new(bar_index, high, "BoS", color=color.green, style=label.style_label_up, textcolor=color.white) // FIXED:
-if choch and not na(low) // FIXED:
-    label.new(bar_index, low, "CHoCH", color=color.red, style=label.style_label_down, textcolor=color.white) // FIXED:
-if fvg_up and bar_index > 2 and not na(high[2]) and not na(low[1]) // FIXED:
-    box.new(bar_index-2, high[2], bar_index-1, low[1], color=color.new(color.green, 80), border_color=color.green) // FIXED:
-    if fvg_up_filled and not na(low[1]) // FIXED:
-        label.new(bar_index, low[1], "FVG Up Filled", color=color.green, style=label.style_label_down, textcolor=color.white) // FIXED:
-if fvg_dn and bar_index > 2 and not na(low[2]) and not na(high[1]) // FIXED:
-    box.new(bar_index-2, low[2], bar_index-1, high[1], color=color.new(color.red, 80), border_color=color.red) // FIXED:
-    if fvg_dn_filled and not na(high[1]) // FIXED:
-        label.new(bar_index, high[1], "FVG Down Filled", color=color.red, style=label.style_label_up, textcolor=color.white) // FIXED:
-if sweep_high and not na(high) // FIXED:
-    label.new(bar_index, high, "Sweep High", color=color.purple, style=label.style_label_up, textcolor=color.white) // FIXED:
-if sweep_low and not na(low) // FIXED:
-    label.new(bar_index, low, "Sweep Low", color=color.purple, style=label.style_label_down, textcolor=color.white) // FIXED:
-if not na(major_swing_high) // FIXED:
-    label.new(bar_index, major_swing_high, "Major High", color=color.orange, style=label.style_label_up, textcolor=color.white) // FIXED:
-if not na(major_swing_low) // FIXED:
-    label.new(bar_index, major_swing_low, "Major Low", color=color.orange, style=label.style_label_down, textcolor=color.white) // FIXED:
+ny_session = is_ny_session and showNy
+london_open = is_london_session and showLdno
+
+bgcolor(per ? ny_session ? nyCss : na : na, editable=false)
+bgcolor(per ? london_open ? ldnoCss : na : na, editable=false)
+
+//=============================================================================
+// INFORMATION PANEL
+//=============================================================================
+
+if barstate.islast
+    var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+    
+    table.cell(info_table, 0, 0, "Market Structure", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, MSS_dir == 1 ? "BULLISH" : MSS_dir == -1 ? "BEARISH" : "NEUTRAL", 
+              text_color=MSS_dir == 1 ? color.lime : MSS_dir == -1 ? color.red : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 1, "Confluence Score", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 1, str.tostring(confluence_score) + "/8", 
+              text_color=confluence_score >= min_confluence ? color.lime : color.orange, text_size=size.small)
+    
+    table.cell(info_table, 0, 2, "Active FVGs", text_color=color.white, text_size=size.small)
+    active_fvg_count = 0
+    if array.size(bFVG_UP_active) > 0
+        for i = 0 to math.min(2, array.size(bFVG_UP_active) - 1)
+            if array.get(bFVG_UP_active, i)
+                active_fvg_count += 1
+    if array.size(bFVG_DN_active) > 0
+        for i = 0 to math.min(2, array.size(bFVG_DN_active) - 1)
+            if array.get(bFVG_DN_active, i)
+                active_fvg_count += 1
+    table.cell(info_table, 1, 2, str.tostring(active_fvg_count), text_color=color.yellow, text_size=size.small)
+    
+    table.cell(info_table, 0, 3, "Order Blocks", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 3, "B:" + str.tostring(array.size(bullish_ob_top)) + " | S:" + str.tostring(array.size(bearish_ob_top)), 
+              text_color=color.aqua, text_size=size.small)
+    
+    table.cell(info_table, 0, 4, "Liquidity Zones", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 4, "BSL:" + str.tostring(array.size(b_liq_B_top)) + " | SSL:" + str.tostring(array.size(b_liq_S_top)), 
+              text_color=color.orange, text_size=size.small)
+    
+    table.cell(info_table, 0, 5, "Session", text_color=color.white, text_size=size.small)
+    session_text := is_london_session ? "LONDON" : is_ny_session ? "NEW YORK" : "OTHER"
+    table.cell(info_table, 1, 5, session_text, text_color=killzone_active ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 6, "Signals Today", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(signal_count_today) + "/" + str.tostring(max_daily_signals), 
+              text_color=signal_count_today < max_daily_signals ? color.lime : color.red, text_size=size.small)
+    
+    table.cell(info_table, 0, 7, "Last Signal", text_color=color.white, text_size=size.small)
+    bars_since_signal = na(last_signal_bar) ? na : bar_index - last_signal_bar
+    signal_status = na(bars_since_signal) ? "NONE" : bars_since_signal < cooldown_bars ? "COOLDOWN(" + str.tostring(cooldown_bars - bars_since_signal) + ")" : "READY"
+    table.cell(info_table, 1, 7, signal_status, 
+              text_color=signal_status == "READY" ? color.lime : signal_status == "NONE" ? color.gray : color.orange, text_size=size.small)
+
+//=============================================================================
+// PLOTS & VISUAL INDICATORS
+//=============================================================================
+
+// Confluence strength indicator
+plotchar(confluence_score >= min_confluence and killzone_active, char="★", location=location.top, 
+         color=color.yellow, size=size.small, title="High Confluence Zone")
+
+// Market structure trend indicator
+mss_dir_change = ta.change(MSS_dir)
+plotshape(MSS_dir == 1 and mss_dir_change != 0, style=shape.triangleup, location=location.belowbar, 
+         color=color.lime, size=size.small, title="Bullish Structure")
+plotshape(MSS_dir == -1 and mss_dir_change != 0, style=shape.triangledown, location=location.abovebar, 
+         color=color.red, size=size.small, title="Bearish Structure")
+
+// Premium/Discount zone lines (optional)
+plot(premium_zone, title="Premium Zone", color=color.new(color.red, 80), linewidth=1, display=display.none)
+plot(discount_zone, title="Discount Zone", color=color.new(color.green, 80), linewidth=1, display=display.none)
+
+//=============================================================================
+// END OF HYBRID ICT TRADING SYSTEM
+//=============================================================================
