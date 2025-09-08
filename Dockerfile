@@ -1,7 +1,7 @@
 # Dockerfile for ICT Smart Money Trading Alert System (FastAPI + async SQLAlchemy)
 # Supports SQLite and PostgreSQL out of the box
 
-FROM python:3.11-slim
+FROM python:3.11.9-slim
 
 # Set workdir
 WORKDIR /app

@@ -1,3 +1,6 @@
+chromadb
+openai
+prometheus-client
 # requirements.txt for Docker build
 fastapi
 uvicorn[standard]
@@ -11,3 +14,9 @@ httpx
 python-telegram-bot
 openai
 # Add any other dependencies your project uses
+httpx>=0.24.0
+pydantic>=2.0
+pytest>=7.0
+python-dotenv>=1.0
+aiodns>=3.0.0
+aiohttp>=3.0.0

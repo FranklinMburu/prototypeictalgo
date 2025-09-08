@@ -2,7 +2,7 @@
 import hashlib
 import hmac
 import os
-from config import settings
+from ict_trading_system.config import settings
 from cryptography.fernet import Fernet, InvalidToken
 
 # --- API Key Encryption Helpers ---

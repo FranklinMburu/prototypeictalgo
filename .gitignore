@@ -1,0 +1,15 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+logs/
+.env
+nohup.out
+.DS_Store
+*.log
+*.out
+*.bak
