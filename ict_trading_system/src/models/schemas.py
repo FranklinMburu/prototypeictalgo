@@ -15,8 +15,9 @@ class SignalCreate(SignalBase):
 
 class Signal(SignalBase):
     id: int
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class AnalysisBase(BaseModel):
     signal_id: int
@@ -30,8 +31,9 @@ class AnalysisCreate(AnalysisBase):
 
 class Analysis(AnalysisBase):
     id: int
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class TradeBase(BaseModel):
     signal_id: int
@@ -48,8 +50,9 @@ class TradeCreate(TradeBase):
 
 class Trade(TradeBase):
     id: int
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class SettingBase(BaseModel):
     key: str
@@ -62,5 +65,6 @@ class SettingCreate(SettingBase):
 
 class Setting(SettingBase):
     id: int
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }

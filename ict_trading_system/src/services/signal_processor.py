@@ -1,11 +1,11 @@
 
 
 import logging
-from src.services.openai_service import analyze_signal
-from src.services.telegram_service import send_telegram_alert, format_alert
-from src.models.database import SessionLocal, Signal, Analysis
+from ict_trading_system.src.services.openai_service import analyze_signal
+from ict_trading_system.src.services.telegram_service import send_telegram_alert, format_alert
+from ict_trading_system.src.models.database import SessionLocal, Signal, Analysis
 from sqlalchemy.exc import SQLAlchemyError
-from config import settings
+from ict_trading_system.config import settings
 import asyncio
 
 from datetime import datetime, timezone
@@ -41,7 +41,22 @@ def validate_signal(signal_data: dict) -> Tuple[bool, str]:
 
 def is_in_killzone(ts: int, session: str = "london,ny") -> bool:
     # Example: London 07:00-10:00 UTC, NY 12:00-15:00 UTC
-    dt = datetime.utcfromtimestamp(ts // 1000)
+    # Accept ts as int (unix ms) or ISO8601 string
+    if isinstance(ts, str):
+        try:
+            # Remove 'Z' if present
+            if ts.endswith('Z'):
+                ts = ts[:-1]
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            # fallback: try parsing as float seconds
+            try:
+                dt = datetime.utcfromtimestamp(float(ts))
+            except Exception:
+                return False
+    else:
+        # Assume ms timestamp
+        dt = datetime.utcfromtimestamp(ts // 1000)
     hour = dt.hour
     if "london" in session and 7 <= hour < 10:
         return True
@@ -50,15 +65,15 @@ def is_in_killzone(ts: int, session: str = "london,ny") -> bool:
     return False
 
 def passes_confluence(signal_data: dict, min_confluences: int = 2) -> bool:
-    # Count True confluences
-    conf = signal_data.get('confluences', {})
-    return sum(1 for v in conf.values() if v == True or v == 1) >= min_confluences
+    # Count confluences (list of strings)
+    conf = signal_data.get('confluences', [])
+    return len(conf) >= min_confluences
 
 def score_signal(signal_data: dict) -> int:
-    # Score based on confluences, session, and signal type
+    # Score based on confluences (list), session, and signal type
     base = 60
-    conf = signal_data.get('confluences', {})
-    n_conf = sum(1 for v in conf.values() if v == True or v == 1)
+    conf = signal_data.get('confluences', [])
+    n_conf = len(conf)
     session_bonus = 10 if is_in_killzone(signal_data['timestamp']) else 0
     type_bonus = 10 if signal_data['signal_type'] in ["CHoCH", "BoS"] else 0
     return min(100, base + n_conf * 10 + session_bonus + type_bonus)
@@ -109,14 +124,35 @@ async def signal_worker():
 
                 # --- AI analysis ---
                 ai_result = analyze_signal(signal_data)
+                # Handle both legacy and repaired JSON formats
+                gpt_analysis = ai_result['content'] if 'content' in ai_result else str(ai_result)
+
                 db_analysis = Analysis(
                     signal_id=db_signal.id,
-                    gpt_analysis=ai_result['content'],
+                    gpt_analysis=gpt_analysis,
                     confidence_score=ai_result.get('score', db_signal.confidence),
                     recommendation=ai_result.get('explanation', ''),
                 )
                 session.add(db_analysis)
                 await session.commit()
+
+                # --- Store embedding in memory agent ---
+                try:
+                    from ict_trading_system.src.utils.memory_agent import add_to_memory
+                    memory_id = f"analysis-{db_analysis.id}"
+                    memory_text = gpt_analysis
+                    memory_meta = {
+                        "symbol": signal_data.get("symbol"),
+                        "timeframe": signal_data.get("timeframe"),
+                        "signal_type": signal_data.get("signal_type"),
+                        "confidence": signal_data.get("confidence"),
+                        "timestamp": str(signal_data.get("timestamp")),
+                        "analysis_id": db_analysis.id,
+                        "signal_id": db_signal.id
+                    }
+                    add_to_memory(memory_id, memory_text, memory_meta)
+                except Exception as e:
+                    logger.error(f"Memory agent error: {e}")
 
                 # --- Send Telegram alert ---
                 alert_msg = format_alert(signal_data, ai_result)

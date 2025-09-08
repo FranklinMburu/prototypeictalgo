@@ -3,7 +3,7 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.sql import func
 import datetime
-from config import settings
+from ict_trading_system.config import settings
 
 Base = declarative_base()
 

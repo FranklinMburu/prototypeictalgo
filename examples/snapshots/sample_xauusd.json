@@ -1,0 +1,15 @@
+{
+  "symbol": "XAUUSD",
+  "snapshot_ts": 1723249200000,
+  "alignment_score": 0.82,
+  "cohesion": 0.76,
+  "analytics": {
+    "volatility_index": 0.43,
+    "accel_M5": 0.012
+  },
+  "tfs": [
+    {"tf": "D", "bias_local": "bullish", "bos": "up", "sweep": "none", "regime": "trend"},
+    {"tf": "H4", "bias_local": "bullish", "bos": "up", "sweep": "none", "regime": "trend"},
+    {"tf": "H1", "bias_local": "neutral", "bos": "none", "sweep": "none", "regime": "flat"}
+  ]
+}

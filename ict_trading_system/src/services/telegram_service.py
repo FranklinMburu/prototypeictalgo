@@ -27,7 +27,7 @@ def send_telegram_message(message: str) -> bool:
 import logging
 import asyncio
 import requests
-from config import settings
+from ict_trading_system.config import settings
 from typing import Dict, Any
 import time
 
@@ -36,26 +36,37 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
 async def send_telegram_alert(message: str, max_retries: int = 3, retry_delay: float = 2.0) -> bool:
-    data = {
-        "chat_id": settings.TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    for attempt in range(1, max_retries + 1):
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, lambda: requests.post(TELEGRAM_API_URL, data=data, timeout=10))
-            if response.status_code == 200:
-                logger.info(f"Telegram alert sent (attempt {attempt}).")
-                return True
-            else:
-                logger.error(f"Telegram error (attempt {attempt}): {response.text}")
-        except Exception as e:
-            logger.error(f"Telegram send error (attempt {attempt}): {e}")
-        if attempt < max_retries:
-            await asyncio.sleep(retry_delay)
-    return False
+    chat_ids = str(settings.TELEGRAM_CHAT_ID).split(",")
+    all_success = True
+    for chat_id in chat_ids:
+        chat_id = chat_id.strip().split()[0]  # Remove comments and whitespace
+        data = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        logger.info(f"[TELEGRAM DEBUG] Bot token: {settings.TELEGRAM_BOT_TOKEN}")
+        logger.info(f"[TELEGRAM DEBUG] Chat ID: {chat_id} (type: {type(chat_id)})")
+        logger.info(f"[TELEGRAM DEBUG] Message: {message}")
+        sent = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, lambda: requests.post(TELEGRAM_API_URL, json=data, timeout=10))
+                if response.status_code == 200:
+                    logger.info(f"Telegram alert sent to {chat_id} (attempt {attempt}).")
+                    sent = True
+                    break
+                else:
+                    logger.error(f"Telegram error for {chat_id} (attempt {attempt}): {response.text}")
+            except Exception as e:
+                logger.error(f"Telegram send error for {chat_id} (attempt {attempt}): {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+        if not sent:
+            all_success = False
+    return all_success
 
 def format_alert(signal: Dict[str, Any], ai_analysis: Dict[str, Any]) -> str:
     conf = ai_analysis.get('score', signal.get('confidence', 0))

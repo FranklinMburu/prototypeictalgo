@@ -1,0 +1,28 @@
+groups:
+  - name: orchestrator_alerts
+    rules:
+      - alert: HighSlackFailures
+        expr: |
+          sum by (job) (rate(notifier_requests_total{channel="slack", status="failure"}[1m])) > 3
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "High Slack failure rate ({{ $value }})"
+          description: "Slack notifier failures exceeded 3/min over the last minute."
+      - alert: HighDedupRate
+        expr: rate(deduplicated_decisions_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High deduplication rate"
+          description: "Deduplicated decisions rate > 1/s over 5m."
+      - alert: AnyCircuitBreakerOpen
+        expr: max(circuit_breaker_open) by (channel) == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open for a channel"
+          description: "One or more notifier circuit breakers are open."

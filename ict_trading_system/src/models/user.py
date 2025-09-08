@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.sql import func
-from src.models.database import Base
+from ict_trading_system.src.models.database import Base
 
 class User(Base):
     __tablename__ = 'users'

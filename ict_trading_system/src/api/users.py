@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from src.models.database import SessionLocal
-from src.models.user import User
-from src.models.user_schemas import UserCreate, UserRead, UserUpdate
+from ict_trading_system.src.models.database import SessionLocal
+from ict_trading_system.src.models.user import User
+from ict_trading_system.src.models.user_schemas import UserCreate, UserRead, UserUpdate
 from sqlalchemy.future import select
 from passlib.context import CryptContext
 

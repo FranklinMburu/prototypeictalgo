@@ -1,9 +1,9 @@
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from config import settings
+from ict_trading_system.config import settings
 import logging
-from src.services.telegram_service import get_bot_status, get_bot_stats, get_bot_settings
+from ict_trading_system.src.services.telegram_service import get_bot_status, get_bot_stats, get_bot_settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
