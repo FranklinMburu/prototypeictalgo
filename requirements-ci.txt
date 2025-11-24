@@ -1,0 +1,9 @@
+# Minimal pinned dependencies needed for CI test collection and common test requirements
+pytest==7.4.0
+pytest-asyncio==0.22.0
+httpx==0.27.0
+fastapi==0.95.0
+pydantic==1.10.7
+uvicorn==0.20.0
+redis==4.5.5
+anyio==3.7.0
