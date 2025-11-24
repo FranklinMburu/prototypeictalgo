@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Background task queue for signal processing
 signal_queue = asyncio.Queue()
@@ -53,15 +54,25 @@ def is_in_killzone(ts: int, session: str = "london,ny") -> bool:
             try:
                 dt = datetime.utcfromtimestamp(float(ts))
             except Exception:
+                logger.error(f"[KILLZONE DEBUG] Could not parse timestamp: {ts}")
                 return False
     else:
         # Assume ms timestamp
         dt = datetime.utcfromtimestamp(ts // 1000)
     hour = dt.hour
+    msg = f"[KILLZONE DEBUG] Parsed datetime: {dt.isoformat()} | Hour: {hour}"
+    logger.info(msg)
+    print(msg)
     if "london" in session and 7 <= hour < 10:
+        logger.info(f"[KILLZONE DEBUG] In London killzone: hour={hour}")
+        print(f"[KILLZONE DEBUG] In London killzone: hour={hour}")
         return True
     if "ny" in session and 12 <= hour < 15:
+        logger.info(f"[KILLZONE DEBUG] In NY killzone: hour={hour}")
+        print(f"[KILLZONE DEBUG] In NY killzone: hour={hour}")
         return True
+    logger.info(f"[KILLZONE DEBUG] Not in killzone: hour={hour}")
+    print(f"[KILLZONE DEBUG] Not in killzone: hour={hour}")
     return False
 
 def passes_confluence(signal_data: dict, min_confluences: int = 2) -> bool:
@@ -79,6 +90,7 @@ def score_signal(signal_data: dict) -> int:
     return min(100, base + n_conf * 10 + session_bonus + type_bonus)
 
 async def process_signal(signal_data: dict):
+    print(f"[PROCESS_SIGNAL DEBUG] Called with: {signal_data}")
     await signal_queue.put(signal_data)
 
 async def signal_worker():

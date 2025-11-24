@@ -35,8 +35,12 @@ try:
 except ImportError:
     llm_reason_from_snapshot = None
 
-import redis.asyncio as aioredis
-from redis.exceptions import NoScriptError
+try:
+    import redis.asyncio as aioredis
+    from redis.exceptions import NoScriptError
+except Exception:
+    aioredis = None
+    NoScriptError = Exception
 
 # --- CONFIG ------------------------------------------------------------------
 TF_ORDER = ["D", "H4", "H1", "M15", "M5", "M3"]
@@ -95,6 +99,40 @@ end
 return 0
 """
 
+
+from utils.redis_wrapper import redis_op
+
+
+def _client_ctx_for(client):
+    class Ctx:
+        def __init__(self, cli):
+            self._redis = cli
+            self._redis_circuit_open_until = 0
+        async def _ensure_redis(self):
+            return
+
+    return Ctx(client)
+
+
+async def _call_redis(client, method: str, *args, **kwargs):
+    """Call method on raw redis client via redis_op and return raw value."""
+    ctx = _client_ctx_for(client)
+    # op_fn will call getattr(r, method)(*args, **kwargs)
+    resp = await redis_op(ctx, lambda r, *a, **kw: getattr(r, method)(*a, **kw), *args, **kwargs)
+    return resp.get("value")
+
+
+async def _run_pipeline(client, pipeline_fn):
+    """Run a pipeline function against client.pipeline() inside redis_op. pipeline_fn is a sync callable that receives the pipeline and queues commands (must not call execute)."""
+    ctx = _client_ctx_for(client)
+
+    def op_fn(r):
+        p = r.pipeline()
+        pipeline_fn(p)
+        return p.execute()
+
+    resp = await redis_op(ctx, op_fn)
+    return resp.get("value")
 
 # --- HELPERS -----------------------------------------------------------------
 def now_ms() -> int:
@@ -176,7 +214,7 @@ def normalize_alert(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --- SYMBOL REGISTRY --------------------------------------------------------
-async def register_symbol(redis: aioredis.Redis, symbol: str) -> None:
+async def register_symbol(redis: Any, symbol: str) -> None:
     """Mark symbol as recently-seen and add to registry set.
 
     Stores a hash with last_seen timestamp for quick inspection.
@@ -184,25 +222,25 @@ async def register_symbol(redis: aioredis.Redis, symbol: str) -> None:
     key_set = "symbols:active"
     key_meta = f"symbol:meta:{symbol}"
     ts = now_ms()
-    pipe = redis.pipeline()
-    pipe.sadd(key_set, symbol)
-    pipe.hset(key_meta, mapping={"last_seen": str(ts)})
-    pipe.expire(key_meta, SYMBOL_REGISTRY_TTL)
-    await pipe.execute()
+    # Wrap pipeline execution in redis_op
+    ctx = type("C", (), {"_redis": redis, "_redis_circuit_open_until": 0, "_ensure_redis": (lambda self: None)})
+    await redis_op(ctx, lambda r, ks, sym, km, lst: (lambda p: (p.sadd(ks, sym), p.hset(km, mapping={"last_seen": str(ts)}), p.expire(km, lst), p.execute()))(r.pipeline()), key_set, symbol, key_meta, SYMBOL_REGISTRY_TTL)
     logger.debug("registered symbol %s", symbol)
 
 
-async def get_active_symbols(redis: aioredis.Redis) -> List[str]:
+async def get_active_symbols(redis: Any) -> List[str]:
     """Return list of currently active symbols (members of symbols:active).
 
     Note: this set can accumulate old symbols; callers may cross-check last_seen.
     """
     key_set = "symbols:active"
-    items = await redis.smembers(key_set)
+    ctx = type("C", (), {"_redis": redis, "_redis_circuit_open_until": 0, "_ensure_redis": (lambda self: None)})
+    resp = await redis_op(ctx, lambda r, key: r.smembers(key), key_set)
+    items = resp.get("value")
     return [i.decode() if isinstance(i, bytes) else i for i in items]
 
 
-async def prune_symbol_registry(redis: aioredis.Redis, max_age_ms: int) -> int:
+async def prune_symbol_registry(redis: Any, max_age_ms: int) -> int:
     """Prune registry entries last_seen older than max_age_ms. Returns number removed.
 
     Useful for periodic background cleanup.
@@ -211,47 +249,52 @@ async def prune_symbol_registry(redis: aioredis.Redis, max_age_ms: int) -> int:
     removed = 0
     members = await get_active_symbols(redis)
     for sym in members:
-        meta_raw = await redis.hget(f"symbol:meta:{sym}", "last_seen")
+        meta_raw = await _call_redis(redis, "hget", f"symbol:meta:{sym}", "last_seen")
         if not meta_raw:
-            await redis.srem("symbols:active", sym)
+            await _call_redis(redis, "srem", "symbols:active", sym)
             removed += 1
             continue
         try:
             ts = int(meta_raw)
             if now - ts > max_age_ms:
-                await redis.srem("symbols:active", sym)
+                await _call_redis(redis, "srem", "symbols:active", sym)
                 removed += 1
         except Exception:
-            await redis.srem("symbols:active", sym)
+            await _call_redis(redis, "srem", "symbols:active", sym)
             removed += 1
     logger.info("pruned %d symbols from registry", removed)
     return removed
 
 
 # --- LUA SCRIPT LOADER ------------------------------------------------------
-async def _get_store_alert_sha(redis: aioredis.Redis) -> str:
+async def _get_store_alert_sha(redis: Any) -> str:
     """Load and cache the Lua script that atomically writes the ring buffer and head."""
     global _STORE_ALERT_SHA
     if _STORE_ALERT_SHA:
         return _STORE_ALERT_SHA
     try:
-        sha = await redis.script_load(_STORE_ALERT_LUA)
+        sha = await _call_redis(redis, "script_load", _STORE_ALERT_LUA)
         _STORE_ALERT_SHA = sha
         return sha
     except Exception:
-        # fallback: try to load by eval (last resort)
-        sha = await redis.script_load(_STORE_ALERT_LUA)
-        _STORE_ALERT_SHA = sha
-        return sha
+        # fallback: try to load by script_load again (best-effort)
+        try:
+            sha = await _call_redis(redis, "script_load", _STORE_ALERT_LUA)
+            _STORE_ALERT_SHA = sha
+            return sha
+        except Exception:
+            raise
 
 
 # --- SAFE LOCK HELPERS ------------------------------------------------------
-async def _acquire_lock(redis: aioredis.Redis, key: str, ttl_ms: int) -> Optional[str]:
+async def _acquire_lock(redis: Any, key: str, ttl_ms: int) -> Optional[str]:
     """Acquire a lock with a random token. Returns token or None."""
     token = uuid.uuid4().hex
     try:
         # SET key token NX PX ttl_ms
-        ok = await redis.set(key, token, nx=True, px=ttl_ms)
+        ctx = type("C", (), {"_redis": redis, "_redis_circuit_open_until": 0, "_ensure_redis": (lambda self: None)})
+        resp = await redis_op(ctx, lambda r, k, tok, nx, px: r.set(k, tok, nx=nx, px=px), key, token, True, ttl_ms)
+        ok = resp.get("value")
         if ok:
             return token
         return None
@@ -259,48 +302,61 @@ async def _acquire_lock(redis: aioredis.Redis, key: str, ttl_ms: int) -> Optiona
         return None
 
 
-async def _release_lock(redis: aioredis.Redis, key: str, token: str) -> bool:
+async def _release_lock(redis: Any, key: str, token: str) -> bool:
     """Release lock only if token matches (atomic). Returns True if released."""
     try:
-        res = await redis.eval(_UNLOCK_LUA, 1, key, token)
+        res = await _call_redis(redis, "eval", _UNLOCK_LUA, 1, key, token)
         return bool(res)
     except Exception:
-        logger.exception("failed to release lock %s", key)
-        return False
-
-
-# --- REDIS RING BUFFERS (Lua-backed atomic store) ----------------------------
-async def store_alert(redis: aioredis.Redis, alert: Dict[str, Any]) -> bool:
-    """Atomically store alert in ring buffer if its timestamp is newer than head.
-
-    Returns True if stored, False if duplicate/out-of-order.
-    Uses preloaded Lua script for atomicity.
-    """
-    key_rb = f"rb:{alert['symbol']}:{alert['tf']}"
-    key_head = f"head:{alert['symbol']}:{alert['tf']}"
-    cap = WINDOW_CAPS.get(alert["tf"], 50)
-    payload = json.dumps(alert)
-    args = [str(alert["ts"]), str(payload), str(cap), str(RB_TTL), str(RB_TTL)]
-    # Debug: print types and values
-    logger.info(f"store_alert keys: {[key_head, key_rb]}")
-    logger.info(f"store_alert args: {args}")
-    logger.info(f"store_alert arg types: {[type(a) for a in args]}")
+        logger.exception("failed to release lock %s, falling back to safer path", key)
+        # try fallback via eval through redis client wrapper
     try:
-        res = await redis.eval(_STORE_ALERT_LUA, 2, key_head, key_rb, *args)
+        resp = await _call_redis(redis, "eval", _UNLOCK_LUA, 1, key, token)
+        return bool(resp)
+    except NoScriptError:
+        # script not loaded/executed; fallback to simple get+del (best-effort)
+        try:
+            cur = await _call_redis(redis, "get", key)
+            if cur and (isinstance(cur, bytes) and cur.decode() == token or cur == token):
+                await _call_redis(redis, "delete", key)
+                return True
+            return False
+        except Exception:
+            return False
+    except Exception:
+        return False
+async def store_alert(redis: Any, alert: Dict[str, Any], cap: Optional[int] = None) -> bool:
+    """Atomically store normalized alert into ring buffer using Lua script. Returns True if stored (not duplicate)."""
+    symbol = alert.get("symbol")
+    tf = alert.get("tf")
+    if not symbol or not tf:
+        return False
+    key_head = f"head:{symbol}:{tf}"
+    key_rb = f"rb:{symbol}:{tf}"
+    cap = cap or WINDOW_CAPS.get(tf, 50)
+    args = [str(alert.get("ts")), json.dumps(alert), str(cap), str(RB_TTL), str(RB_TTL)]
+    try:
+        sha = await _get_store_alert_sha(redis)
+        try:
+            res = await _call_redis(redis, "evalsha", sha, 2, key_head, key_rb, *args)
+        except NoScriptError:
+            # script not found server-side, reload and retry
+            sha = await _get_store_alert_sha(redis)
+            res = await _call_redis(redis, "evalsha", sha, 2, key_head, key_rb, *args)
         return int(res) == 1
     except Exception:
         logger.exception("store_alert failed for %s %s", alert.get("symbol"), alert.get("tf"))
         return False
 
 
-async def fetch_window(redis: aioredis.Redis, symbol: str, tf: str, n: Optional[int] = None) -> List[Dict[str, Any]]:
+async def fetch_window(redis: Any, symbol: str, tf: str, n: Optional[int] = None) -> List[Dict[str, Any]]:
     """Fetch up to `n` normalized alerts from the ring buffer (newest first).
 
     Returns deduplicated list ordered newest->oldest.
     """
     key_rb = f"rb:{symbol}:{tf}"
     cap = n or WINDOW_CAPS.get(tf, 50)
-    items = await redis.lrange(key_rb, 0, cap - 1)
+    items = await _call_redis(redis, "lrange", key_rb, 0, cap - 1)
     alerts: List[Dict[str, Any]] = []
     for raw in items:
         try:
@@ -402,7 +458,7 @@ def align_score(tf_summaries: List[Dict[str, Any]]) -> Tuple[float, List[str]]:
 
 
 # --- METRICS HELPER ---------------------------------------------------------
-async def record_metric(redis: aioredis.Redis, name: str, value: float = 1.0, ttl: int = 7 * 24 * 3600) -> None:
+async def record_metric(redis: Any, name: str, value: float = 1.0, ttl: int = 7 * 24 * 3600) -> None:
     """Increment numeric metric. Chooses integer or float increment accordingly.
 
     Keys are: metrics:{name}
@@ -411,11 +467,11 @@ async def record_metric(redis: aioredis.Redis, name: str, value: float = 1.0, tt
     try:
         # prefer integer increments if value is an integer
         if float(value).is_integer():
-            await redis.incrby(key, int(value))
+            await _call_redis(redis, "incrby", key, int(value))
         else:
             # incrbyfloat is supported by aioredis
-            await redis.incrbyfloat(key, float(value))
-        await redis.expire(key, ttl)
+            await _call_redis(redis, "incrbyfloat", key, float(value))
+        await _call_redis(redis, "expire", key, ttl)
     except Exception:
         logger.exception("failed to record metric %s", name)
 
@@ -495,7 +551,7 @@ def _compute_trend_acceleration_from_alerts(alerts: List[Dict[str, Any]], lookba
     return float(acc)
 
 
-async def fuse(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
+async def fuse(redis: Any, symbol: str) -> Optional[Dict[str, Any]]:
     """Build and cache fused snapshot for `symbol`.
 
     Improvements:
@@ -508,7 +564,7 @@ async def fuse(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
     t0 = time.time()
     token = await _acquire_lock(redis, lock_key, LOCK_TTL_MS)
     if not token:
-        raw = await redis.get(f"fuse:{symbol}")
+        raw = await _call_redis(redis, "get", f"fuse:{symbol}")
         if raw:
             try:
                 return json.loads(raw)
@@ -557,35 +613,30 @@ async def fuse(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
         }
 
         # cache snapshot
-        await redis.set(f"fuse:{symbol}", json.dumps(snapshot), ex=FUSE_TTL)
+        await _call_redis(redis, "set", f"fuse:{symbol}", json.dumps(snapshot), ex=FUSE_TTL)
 
         # metrics: batch updates
         latency_ms = int((time.time() - t0) * 1000)
-        pipe = redis.pipeline()
-        # global and per-symbol fuse latency counters (integer increments to count occurrences, but also record latest latency)
-        pipe.incrby(f"{METRICS_PREFIX}:fuse_count", 1)
-        pipe.expire(f"{METRICS_PREFIX}:fuse_count", 7 * 24 * 3600)
-        # store per-symbol latency as an incremented counter and also a separate keyed latest latency gauge
-        pipe.incrby(f"{METRICS_PREFIX}:fuse_latency_count:{symbol}", 1)
-        pipe.expire(f"{METRICS_PREFIX}:fuse_latency_count:{symbol}", 7 * 24 * 3600)
-        pipe.incrby(f"{METRICS_PREFIX}:fuse_latency_sum_ms:{symbol}", latency_ms)
-        pipe.expire(f"{METRICS_PREFIX}:fuse_latency_sum_ms:{symbol}", 7 * 24 * 3600)
-        # snapshot age gauge
         snapshot_age = now_ms() - snapshot["snapshot_ts"]
-        pipe.set(f"{METRICS_PREFIX}:snapshot_age_ms:{symbol}", str(snapshot_age))
-        pipe.expire(f"{METRICS_PREFIX}:snapshot_age_ms:{symbol}", 24 * 3600)
 
-        # ring buffer fill ratio metrics (use incrbyfloat)
-        for tf, alerts in alerts_by_tf.items():
-            llen = len(alerts)
-            cap = float(WINDOW_CAPS.get(tf, 50))
-            ratio = float(llen) / cap if cap else 0.0
-            pipe.incrbyfloat(f"{METRICS_PREFIX}:rb_fill_ratio:{symbol}:{tf}", ratio)
-            pipe.expire(f"{METRICS_PREFIX}:rb_fill_ratio:{symbol}:{tf}", 7 * 24 * 3600)
+        def _queue_metrics(p):
+            p.incrby(f"{METRICS_PREFIX}:fuse_count", 1)
+            p.expire(f"{METRICS_PREFIX}:fuse_count", 7 * 24 * 3600)
+            p.incrby(f"{METRICS_PREFIX}:fuse_latency_count:{symbol}", 1)
+            p.expire(f"{METRICS_PREFIX}:fuse_latency_count:{symbol}", 7 * 24 * 3600)
+            p.incrby(f"{METRICS_PREFIX}:fuse_latency_sum_ms:{symbol}", latency_ms)
+            p.expire(f"{METRICS_PREFIX}:fuse_latency_sum_ms:{symbol}", 7 * 24 * 3600)
+            p.set(f"{METRICS_PREFIX}:snapshot_age_ms:{symbol}", str(snapshot_age))
+            p.expire(f"{METRICS_PREFIX}:snapshot_age_ms:{symbol}", 24 * 3600)
+            for tf, alerts in alerts_by_tf.items():
+                llen = len(alerts)
+                cap = float(WINDOW_CAPS.get(tf, 50))
+                ratio = float(llen) / cap if cap else 0.0
+                p.incrbyfloat(f"{METRICS_PREFIX}:rb_fill_ratio:{symbol}:{tf}", ratio)
+                p.expire(f"{METRICS_PREFIX}:rb_fill_ratio:{symbol}:{tf}", 7 * 24 * 3600)
 
-        # execute pipeline
         try:
-            await pipe.execute()
+            await _run_pipeline(redis, _queue_metrics)
         except Exception:
             logger.exception("failed to execute metrics pipeline in fuse for %s", symbol)
 
@@ -599,7 +650,7 @@ async def fuse(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
 
 
 # --- BIAS HISTORY & ON_NEW_ALERT ---------------------------------------------
-async def on_new_alert(redis: aioredis.Redis, raw_payload: Dict[str, Any], record_metrics: bool = True) -> Optional[Dict[str, Any]]:
+async def on_new_alert(redis: Any, raw_payload: Dict[str, Any], record_metrics: bool = True) -> Optional[Dict[str, Any]]:
     """Process a new raw alert payload.
 
     Steps:
@@ -650,31 +701,27 @@ async def on_new_alert(redis: aioredis.Redis, raw_payload: Dict[str, Any], recor
         if last is None:
             last = snap["tfs"][-1]
         entry = {"ts": snap["snapshot_ts"], "bias": last.get("bias_local"), "score": snap.get("alignment_score")}
-        pipe = redis.pipeline()
-        pipe.lpush(f"bias_hist:{alert['symbol']}", json.dumps(entry))
-        pipe.ltrim(f"bias_hist:{alert['symbol']}", 0, 99)
-        pipe.expire(f"bias_hist:{alert['symbol']}", BIAS_HIST_TTL)
         try:
-            await pipe.execute()
+            await _run_pipeline(redis, lambda p: (p.lpush(f"bias_hist:{alert['symbol']}", json.dumps(entry)), p.ltrim(f"bias_hist:{alert['symbol']}", 0, 99), p.expire(f"bias_hist:{alert['symbol']}", BIAS_HIST_TTL)))
         except Exception:
             logger.exception("failed to update bias history for %s", alert["symbol"])
     return snap
 
 
 # --- ANALYTICAL METRICS LAYER (backwards-compatible wrappers) -----------------
-async def compute_trend_acceleration(redis: aioredis.Redis, symbol: str, tf: str, lookback: int = 10) -> float:
+async def compute_trend_acceleration(redis: Any, symbol: str, tf: str, lookback: int = 10) -> float:
     """Public wrapper: compute trend acceleration by fetching alerts if needed."""
     alerts = await fetch_window(redis, symbol, tf, n=lookback)
     # adapt to _compute_trend_acceleration_from_alerts
     return _compute_trend_acceleration_from_alerts(alerts, lookback=lookback)
 
 
-async def compute_bias_shift_rate(redis: aioredis.Redis, symbol: str, lookback: int = 50) -> float:
+async def compute_bias_shift_rate(redis: Any, symbol: str, lookback: int = 50) -> float:
     """Compute rate of bias changes (shifts per lookback window) using bias_hist.
 
     Returns value in [0,1] representing fraction of entries that represent a bias change.
     """
-    raw = await redis.lrange(f"bias_hist:{symbol}", 0, lookback - 1)
+    raw = await _call_redis(redis, "lrange", f"bias_hist:{symbol}", 0, lookback - 1)
     if not raw:
         return 0.0
     biases = []
@@ -693,7 +740,7 @@ async def compute_bias_shift_rate(redis: aioredis.Redis, symbol: str, lookback: 
     return changes / max(1, len(biases) - 1)
 
 
-async def compute_volatility_index(redis: aioredis.Redis, symbol: str) -> float:
+async def compute_volatility_index(redis: Any, symbol: str) -> float:
     """Public wrapper: compute vol index by fetching alerts for TFs."""
     alerts_by_tf: Dict[str, List[Dict[str, Any]]] = {}
     for tf in TF_ORDER:
@@ -710,12 +757,12 @@ async def reason_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     return await llm_reason_from_snapshot(snapshot)
 
 
-async def reason_from_symbol(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
+async def reason_from_symbol(redis: Any, symbol: str) -> Optional[Dict[str, Any]]:
     """Helper: fetch fused snapshot and run reasoner stub.
 
     Returns decision or None if no snapshot.
     """
-    raw = await redis.get(f"fuse:{symbol}")
+    raw = await _call_redis(redis, "get", f"fuse:{symbol}")
     if not raw:
         return None
     if isinstance(raw, bytes):
@@ -728,7 +775,7 @@ async def reason_from_symbol(redis: aioredis.Redis, symbol: str) -> Optional[Dic
 
 
 # --- SIMULATION ENGINE ------------------------------------------------------
-async def replay_alerts(redis: aioredis.Redis, alerts: List[Dict[str, Any]], speed: float = 0.0) -> List[Optional[Dict[str, Any]]]:
+async def replay_alerts(redis: Any, alerts: List[Dict[str, Any]], speed: float = 0.0) -> List[Optional[Dict[str, Any]]]:
     """Replay a list of raw alert payloads through on_new_alert.
 
     - speed: seconds to await between alerts. 0 means as fast as possible.
@@ -760,12 +807,12 @@ async def load_alerts_from_file(path: str) -> List[Dict[str, Any]]:
 
 
 # --- UTILITIES / CLI ---------------------------------------------------------
-async def init_redis(url: str = "redis://localhost/0") -> aioredis.Redis:
-    return aioredis.from_url(url, decode_responses=False)
+async def init_redis(url: str = "redis://localhost/0") -> Any:
+    return aioredis.from_url(url, decode_responses=False) if aioredis is not None else None
 
 
-async def inspect_snapshot(redis: aioredis.Redis, symbol: str) -> Optional[Dict[str, Any]]:
-    raw = await redis.get(f"fuse:{symbol}")
+async def inspect_snapshot(redis: Any, symbol: str) -> Optional[Dict[str, Any]]:
+    raw = await _call_redis(redis, "get", f"fuse:{symbol}")
     if not raw:
         return None
     if isinstance(raw, bytes):

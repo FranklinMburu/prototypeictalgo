@@ -1,0 +1,12 @@
+groups:
+  - name: reasoner-service.rules
+    rules:
+      - alert: ReasonerServiceDLQHigh
+        expr: |
+          probe_or_none(dlq_size) or dlq_size > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reasoner service DLQ queue size is high"
+          description: "The decision DLQ has non-zero items for more than 5 minutes. This indicates persistence failures or backpressure. Current value: {{ $value }}"

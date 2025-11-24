@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List, Tuple
 
 import redis.asyncio as redis
+from utils.redis_wrapper import redis_op
 
 from .config import get_settings
 from .alerts import SlackNotifier, DiscordNotifier, TelegramNotifier
@@ -26,6 +27,18 @@ from . import metrics
 DLQ_STREAM_KEY = "deadletter:notifications"
 
 _cfg = get_settings()
+
+
+def _client_ctx_for(client):
+    """Return a minimal ctx object wrapping a raw redis client for redis_op."""
+    class Ctx:
+        def __init__(self, cli):
+            self._redis = cli
+            self._redis_circuit_open_until = 0
+        async def _ensure_redis(self):
+            return
+
+    return Ctx(client)
 
 # Defaults (configurable by env via get_settings if you choose to extend)
 DEFAULT_POLL_INTERVAL = 15  # seconds between scans
@@ -93,9 +106,11 @@ async def publish_deadletter(
     next_retry = next_retry_utc or (_now_utc() + timedelta(seconds=base_backoff_seconds * (2 ** (attempts - 1))))
     retry_meta = {"attempts": int(attempts), "base_backoff_seconds": float(base_backoff_seconds), "next_retry_utc": next_retry.isoformat()}
     entry["retry_meta"] = json.dumps(retry_meta)
-    # XADD stream
+    # XADD stream via redis_op wrapper
     try:
-        stream_id = await redis.xadd(DLQ_STREAM_KEY, entry, max_len=DEFAULT_STREAM_TRIM_LEN, approximate=False)
+        ctx = _client_ctx_for(redis)
+        resp = await redis_op(ctx, lambda r, key, ent, max_len, approx: r.xadd(key, ent, max_len=max_len, approximate=approx), DLQ_STREAM_KEY, entry, DEFAULT_STREAM_TRIM_LEN, False)
+        stream_id = resp.get("value")
         logger.info("Published deadletter id=%s decision=%s channel=%s attempts=%d", stream_id, decision_id, channel, attempts)
         return stream_id
     except Exception:
@@ -197,7 +212,8 @@ async def _process_deadletter_entry(redis: redis.Redis, stream_id: str, fields: 
     if res.get("ok"):
         # success: remove from stream and log success
         try:
-            await redis.xdel(DLQ_STREAM_KEY, stream_id)
+            ctx = _client_ctx_for(redis)
+            await redis_op(ctx, lambda r, key, sid: r.xdel(key, sid), DLQ_STREAM_KEY, stream_id)
         except Exception:
             logger.exception("Failed to delete DLQ entry %s after success", stream_id)
         try:
@@ -213,7 +229,8 @@ async def _process_deadletter_entry(redis: redis.Redis, stream_id: str, fields: 
         if attempts > max_retries:
             # move to final-failed territory: remove or set TTL marker
             try:
-                await redis.xdel(DLQ_STREAM_KEY, stream_id)
+                ctx = _client_ctx_for(redis)
+                await redis_op(ctx, lambda r, key, sid: r.xdel(key, sid), DLQ_STREAM_KEY, stream_id)
             except Exception:
                 logger.exception("Failed to delete DLQ entry %s after max retries", stream_id)
             # log final failure
@@ -236,10 +253,11 @@ async def _process_deadletter_entry(redis: redis.Redis, stream_id: str, fields: 
             "retry_meta": json.dumps(new_retry_meta),
         }
         try:
+            ctx = _client_ctx_for(redis)
             # append new entry and trim
-            await redis.xadd(DLQ_STREAM_KEY, new_entry, max_len=DEFAULT_STREAM_TRIM_LEN, approximate=False)
+            await redis_op(ctx, lambda r, key, ent, max_len, approx: r.xadd(key, ent, max_len=max_len, approximate=approx), DLQ_STREAM_KEY, new_entry, DEFAULT_STREAM_TRIM_LEN, False)
             # remove old entry
-            await redis.xdel(DLQ_STREAM_KEY, stream_id)
+            await redis_op(ctx, lambda r, key, sid: r.xdel(key, sid), DLQ_STREAM_KEY, stream_id)
             logger.info("Re-scheduled DLQ id=%s to next_retry=%s attempts=%d", stream_id, next_retry.isoformat(), attempts)
         except Exception:
             logger.exception("Failed to reschedule DLQ entry %s", stream_id)
@@ -283,7 +301,9 @@ async def poll_deadletter_loop(
         try:
             # XRANGE from last_id (exclusive) to +, limit max_batch
             # If last_id == "0-0", include from beginning
-            entries = await redis.xrange(DLQ_STREAM_KEY, min=last_id, max="+", count=max_batch)
+            ctx = _client_ctx_for(redis)
+            resp = await redis_op(ctx, lambda r, key, min, max, count: r.xrange(key, min=min, max=max, count=count), DLQ_STREAM_KEY, min=last_id, max="+", count=max_batch)
+            entries = resp.get("value")
             if not entries:
                 # no entries; sleep and continue
                 await asyncio.sleep(poll_interval)
@@ -320,7 +340,9 @@ async def retry_deadletter_by_decision_id(redis: redis.Redis, engine: Optional[A
     if semaphore is None:
         semaphore = asyncio.Semaphore(3)
     # scan entire stream (could be optimized via indices or consumer groups)
-    entries = await redis.xrange(DLQ_STREAM_KEY, min="-", max="+", count=DEFAULT_STREAM_TRIM_LEN)
+    ctx = _client_ctx_for(redis)
+    resp = await redis_op(ctx, lambda r, key, min, max, count: r.xrange(key, min=min, max=max, count=count), DLQ_STREAM_KEY, min="-", max="+", count=DEFAULT_STREAM_TRIM_LEN)
+    entries = resp.get("value")
     for stream_id, fields in entries:
         _, channel, payload, _, _, retry_meta = await _reconstruct_payload_from_entry(fields)
         # decision_id parsed from fields
@@ -344,7 +366,9 @@ async def retry_deadletter_by_timerange(redis: redis.Redis, engine: Optional[Any
     Returns number attempted.
     """
     count = 0
-    entries = await redis.xrange(DLQ_STREAM_KEY, min="-", max="+", count=DEFAULT_STREAM_TRIM_LEN)
+    ctx = _client_ctx_for(redis)
+    resp = await redis_op(ctx, lambda r, key, min, max, count: r.xrange(key, min=min, max=max, count=count), DLQ_STREAM_KEY, min="-", max="+", count=DEFAULT_STREAM_TRIM_LEN)
+    entries = resp.get("value")
     for stream_id, fields in entries:
         try:
             decision_id, channel, payload, error, ts, retry_meta = await _reconstruct_payload_from_entry(fields)

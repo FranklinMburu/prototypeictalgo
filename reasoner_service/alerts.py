@@ -287,10 +287,16 @@ class SlackNotifier:
         except Exception as e:
             logger.error(f"Slack notify failed: {e}")
             try:
-                import redis.asyncio as redis
-                redis_conn = await redis.from_url(_cfg.REDIS_URL)
-                await deadletter.publish_deadletter(redis_conn, decision_id, "slack", payload, str(e))
-                await redis_conn.close()
+                # Try to use redis if available; if not, call publish_deadletter with None-safe behavior
+                try:
+                    import importlib
+                    redis_mod = importlib.import_module("redis.asyncio")
+                    redis_conn = await redis_mod.from_url(_cfg.REDIS_URL)
+                    await deadletter.publish_deadletter(redis_conn, decision_id, "slack", payload, str(e))
+                    await redis_conn.close()
+                except Exception:
+                    logger.debug("redis not available to publish DLQ; calling publish_deadletter without live client")
+                    await deadletter.publish_deadletter(None, decision_id, "slack", payload, str(e))
             except Exception as dlq_e:
                 logger.error(f"DLQ publish failed: {dlq_e}")
             await error_budget.register(False)
@@ -331,10 +337,15 @@ class DiscordNotifier:
         except Exception as e:
             logger.error(f"Discord notify failed: {e}")
             try:
-                import redis.asyncio as redis
-                redis_conn = await redis.from_url(_cfg.REDIS_URL)
-                await deadletter.publish_deadletter(redis_conn, decision_id, "discord", payload, str(e))
-                await redis_conn.close()
+                try:
+                    import importlib
+                    redis_mod = importlib.import_module("redis.asyncio")
+                    redis_conn = await redis_mod.from_url(_cfg.REDIS_URL)
+                    await deadletter.publish_deadletter(redis_conn, decision_id, "discord", payload, str(e))
+                    await redis_conn.close()
+                except Exception:
+                    logger.debug("redis not available to publish DLQ; calling publish_deadletter without live client")
+                    await deadletter.publish_deadletter(None, decision_id, "discord", payload, str(e))
             except Exception as dlq_e:
                 logger.error(f"DLQ publish failed: {dlq_e}")
             await error_budget.register(False)
@@ -385,10 +396,15 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Telegram notify failed: {e}")
             try:
-                import redis.asyncio as redis
-                redis_conn = await redis.from_url(_cfg.REDIS_URL)
-                await deadletter.publish_deadletter(redis_conn, decision_id, "telegram", payload, str(e))
-                await redis_conn.close()
+                try:
+                    import importlib
+                    redis_mod = importlib.import_module("redis.asyncio")
+                    redis_conn = await redis_mod.from_url(_cfg.REDIS_URL)
+                    await deadletter.publish_deadletter(redis_conn, decision_id, "telegram", payload, str(e))
+                    await redis_conn.close()
+                except Exception:
+                    logger.debug("redis not available to publish DLQ; calling publish_deadletter without live client")
+                    await deadletter.publish_deadletter(None, decision_id, "telegram", payload, str(e))
             except Exception as dlq_e:
                 logger.error(f"DLQ publish failed: {dlq_e}")
             await error_budget.register(False)

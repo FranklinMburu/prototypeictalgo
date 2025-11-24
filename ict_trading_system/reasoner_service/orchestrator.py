@@ -6,13 +6,14 @@ To use this code, always run from the project root with:
 or import DecisionOrchestrator from another module.
 """
 
+from __future__ import annotations
+
+
 if __name__ == "__main__":
     raise RuntimeError(
         "This file is part of a package and cannot be run directly. "
         "Use: python -m ict_trading_system.reasoner_service.orchestrator from the project root."
     )
-
-from __future__ import annotations
 
 import asyncio
 import json
