@@ -1,9 +1,9 @@
 {
-  "symbol": "XAUUSD",
+  "symbol": "XAGx USD",
   "timeframe": "15m",
   "signal_type": "CHoCH",
-  "confidence": 88,
-  "timestamp": 1694166000000,
+  "confidence": 90,
+  "timestamp": 1752136200000,
   "price_data": {"open": 1920.5, "high": 1925.0, "low": 1918.0, "close": 1922.0},
   "sl": 1915.0,
   "tp": 1930.0,
