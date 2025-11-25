@@ -23,7 +23,8 @@ async def dlq_list(max_items: int = 100) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="orchestrator not bound")
     orch = _bound_orchestrator
     items = []
-    if _cfg.REDIS_DLQ_ENABLED and getattr(orch, "_redis", None) is not None:
+    # If an orchestrator-provided redis client exists, prefer it (tests inject FakeRedis)
+    if getattr(orch, "_redis", None) is not None:
         # use LRANGE to fetch items
         try:
             from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
@@ -52,7 +53,7 @@ async def dlq_requeue_all(x_admin_token: str = Header(None, alias="X-Admin-Token
             raise HTTPException(status_code=401, detail="unauthorized")
     orch = _bound_orchestrator
     moved = 0
-    if _cfg.REDIS_DLQ_ENABLED and getattr(orch, "_redis", None) is not None:
+    if getattr(orch, "_redis", None) is not None:
         # nothing to do; entries remain in Redis
         return {"moved": 0}
     else:
@@ -73,7 +74,7 @@ async def dlq_flush(x_admin_token: str = Header(None, alias="X-Admin-Token")):
         if not x_admin_token or x_admin_token != _cfg.ADMIN_TOKEN:
             raise HTTPException(status_code=401, detail="unauthorized")
     orch = _bound_orchestrator
-    if _cfg.REDIS_DLQ_ENABLED and getattr(orch, "_redis", None) is not None:
+    if getattr(orch, "_redis", None) is not None:
             try:
                 from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
                 try:

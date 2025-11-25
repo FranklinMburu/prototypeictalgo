@@ -93,6 +93,9 @@ def analyze_signal(signal_data: dict) -> Dict[str, Any]:
     logger.info(f"[AI RAW RESPONSE] {content}")
     try:
         parsed = json.loads(content)
+        # Keep raw AI text for callers that expect it
+        if isinstance(parsed, dict) and "content" not in parsed:
+            parsed["content"] = content
         return parsed
     except Exception:
         # Try to extract JSON substring using regex
@@ -102,6 +105,8 @@ def analyze_signal(signal_data: dict) -> Dict[str, Any]:
             try:
                 parsed = json.loads(json_str)
                 logger.info("[AI JSON REPAIR] Successfully extracted JSON from response.")
+                if isinstance(parsed, dict) and "content" not in parsed:
+                    parsed["content"] = content
                 return parsed
             except Exception as e2:
                 logger.warning(f"[AI JSON REPAIR] Failed to parse extracted JSON: {e2}")

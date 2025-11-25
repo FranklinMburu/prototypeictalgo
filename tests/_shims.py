@@ -99,3 +99,44 @@ class FastApiIntegration:
         pass
 fastapi_integ.FastApiIntegration = FastApiIntegration
 sys.modules['sentry_sdk.integrations.fastapi'] = fastapi_integ
+
+# aiosqlite shim: provide an async connect function used by SQLAlchemy aiosqlite dialect at import
+import importlib
+if importlib.util.find_spec('aiosqlite') is None:
+    import types as _types_local
+    _aiosqlite_mod = _types_local.ModuleType('aiosqlite')
+    async def _aiosqlite_connect(*args, **kwargs):
+        class DummyConn:
+            async def execute(self, *a, **k):
+                return None
+            async def close(self):
+                return None
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+        return DummyConn()
+
+    class DatabaseError(Exception):
+        pass
+    class OperationalError(DatabaseError):
+        pass
+    class IntegrityError(DatabaseError):
+        pass
+
+    _aiosqlite_mod.connect = _aiosqlite_connect
+    _aiosqlite_mod.DatabaseError = DatabaseError
+    _aiosqlite_mod.OperationalError = OperationalError
+    _aiosqlite_mod.IntegrityError = IntegrityError
+    _aiosqlite_mod.paramstyle = 'qmark'
+
+    # Provide aliases expected by SQLAlchemy/aiosqlite dialect
+    _aiosqlite_mod.Error = DatabaseError
+    _aiosqlite_mod.InterfaceError = DatabaseError
+    _aiosqlite_mod.Warning = Exception
+    _aiosqlite_mod.NotSupportedError = DatabaseError
+    _aiosqlite_mod.ProgrammingError = DatabaseError
+    _aiosqlite_mod.sqlite_version = '3.39.0'
+    _aiosqlite_mod.sqlite_version_info = (3, 39, 0)
+
+    sys.modules['aiosqlite'] = _aiosqlite_mod

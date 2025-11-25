@@ -64,3 +64,4 @@ def start_metrics_server_if_enabled():
             start_http_server(cfg.METRICS_PORT)  # type: ignore
     except Exception:
         logger.exception("failed to start metrics server")
+
