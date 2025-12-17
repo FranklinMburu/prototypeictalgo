@@ -22,37 +22,44 @@ _cfg = get_settings()
 
 
 class PolicyStore:
-    """Simple PolicyStore interface.
+    """Facade for pluggable policy backends with chained fallback.
 
-    Implementations should provide async `get_policy(policy_name, context)`.
-    The default implementation below falls back to reading markers from the
-    provided `context` when no authoritative policy config is available on
-    the orchestrator. This keeps behavior backward-compatible for tests.
+    PolicyStore coordinates multiple backends (config, HTTP, Redis, markers)
+    and falls back through them in order until a policy is found. This enables
+    authoritative policy services while maintaining backward-compatibility.
     """
-    def __init__(self, orch: "DecisionOrchestrator"):
+    def __init__(self, orch: "DecisionOrchestrator", backends=None):
+        """Initialize PolicyStore with optional custom backends.
+
+        Args:
+            orch: Reference to DecisionOrchestrator
+            backends: Optional list of PolicyBackend instances; if None, uses defaults
+        """
         self.orch = orch
+        if backends is None:
+            # Default backend chain: orchestrator config -> marker fallback
+            from .policy_backends import OrchestratorConfigBackend, DefaultPolicyBackend
+            backends = [
+                OrchestratorConfigBackend(orch),
+                DefaultPolicyBackend(),
+            ]
+        self.backends = backends
 
     async def get_policy(self, policy_name: str, context: dict) -> dict:
-        # Try orchestrator-level policy config first
-        try:
-            cfg_obj = getattr(self.orch, "_policy_config", None)
-            if cfg_obj and policy_name in cfg_obj:
-                return cfg_obj.get(policy_name) or {}
-        except Exception:
-            pass
+        """Get policy from backends in priority order.
 
-        # Fallback: derive policy values from context markers (preserve legacy behavior)
-        if policy_name == "killzone":
-            return {"active": bool(context.get("killzone", False))}
-        if policy_name == "regime":
-            return {"regime": context.get("regime")}
-        if policy_name == "cooldown":
-            return {"cooldown_until": int(context.get("cooldown_until", 0) or 0)}
-        if policy_name == "exposure":
-            return {"exposure": float(context.get("exposure", 0) or 0), "max_exposure": float(context.get("max_exposure", 0) or 0)}
-        if policy_name == "confidence_threshold":
-            # default minimum confidence for 'enter' decisions
-            return {"min_confidence": 0.5}
+        Tries each backend until one returns a non-empty result. This allows
+        orchestrator config to override markers, HTTP services to override local
+        config, and so on.
+        """
+        for backend in self.backends:
+            try:
+                result = await backend.get_policy(policy_name, context)
+                if result:  # Non-empty dict means policy found
+                    return result
+            except Exception:
+                continue
+        # Fallback: empty dict (policy not configured)
         return {}
 
 
