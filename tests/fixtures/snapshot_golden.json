@@ -1,0 +1,9 @@
+{
+  "symbol": "TST",
+  "confidence": 90,
+  "price_data": { "close": 123.45 },
+  "signal_type": "unit_test_signal",
+  "tp": 130.0,
+  "sl": 120.0,
+  "timestamp_ms": 1700000000000
+}
