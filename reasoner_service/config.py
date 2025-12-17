@@ -31,6 +31,9 @@ class Settings:
     REDIS_CIRCUIT_COOLDOWN_SECONDS: float = float(os.getenv("REDIS_CIRCUIT_COOLDOWN_SECONDS", "60"))
     # Admin API token for basic protection of requeue/flush endpoints
     ADMIN_TOKEN: str = os.getenv("REASONER_ADMIN_TOKEN", "")
+    # Feature toggles for Plan Executor
+    ENABLE_PLAN_EXECUTOR: bool = bool(int(os.getenv("ENABLE_PLAN_EXECUTOR", "0")))
+    DEBUG_PLAN_EXECUTOR: bool = bool(int(os.getenv("DEBUG_PLAN_EXECUTOR", "0")))
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

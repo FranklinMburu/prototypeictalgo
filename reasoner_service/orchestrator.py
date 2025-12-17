@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from typing import Optional, Dict, Any, List
+from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timezone
 
 
@@ -51,6 +52,29 @@ class DecisionOrchestrator:
         except Exception:
             self._routing_rules = {}
             self._routing_overrides = []
+        # Lightweight reasoner adapter exposing a coroutine `call(prompt, signal, decision)`.
+        # This delegates to the repository's existing reasoning path and does not bypass
+        # orchestration policy or enforcement.
+        async def _reasoner_call(prompt, signal=None, decision=None):
+            snap: Dict[str, Any] = {}
+            try:
+                if isinstance(signal, dict):
+                    snap.update(signal)
+                if isinstance(decision, dict):
+                    snap.update(decision)
+                if prompt is not None:
+                    # preserve prompt for downstream reasoner implementations
+                    snap.setdefault("prompt", prompt)
+                    snap.setdefault("summary", str(prompt))
+                # delegate to existing reasoning implementation
+                from .reasoner import reason_from_snapshot
+
+                return await reason_from_snapshot(snap)
+            except Exception as e:
+                logger.exception("reasoner adapter call failed: %s", e)
+                return {"error": str(e)}
+
+        self.reasoner = SimpleNamespace(call=_reasoner_call)
 
     # --- Safety helper: normalized dedup key ---
     def _compute_dedup_key(self, decision: Dict[str, Any]) -> str:
@@ -84,6 +108,25 @@ class DecisionOrchestrator:
         bucket_s = max(1, int(get_settings().DEDUP_WINDOW_SECONDS))
         ts_bucket = int((ts_ms // 1000) // bucket_s)
         return f"norm:{symbol}:{rec}:{conf}:{ts_bucket}"
+
+    # --- Policy gate scaffolding (placeholders) ---
+    def pre_reasoning_policy_check(self, snapshot: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Pre-reasoning policy gate (placeholder).
+
+        This hook is intentionally permissive and returns a PASS result unconditionally.
+        It exists to make the pre-reasoning validation point explicit for future
+        policy enforcement (Level 2) work. It must not alter or veto execution.
+        """
+        return {"result": "pass"}
+
+    def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Post-reasoning policy gate (placeholder).
+
+        This hook is intentionally permissive and returns a PASS result unconditionally.
+        It exists as a clear location for future policy decisions without changing
+        current orchestrator behavior.
+        """
+        return {"result": "pass"}
 
     async def setup(self):
         # Create async engine and sessionmaker pair. Use sessionmaker for persistence calls.
@@ -241,8 +284,40 @@ class DecisionOrchestrator:
         # default fallback: all channels
         return ["slack", "discord", "telegram"]
 
+    async def execute_plan_if_enabled(self, plan: Dict[str, Any], execution_ctx) -> Dict[str, Any]:
+        # minimal adapter: delegates to PlanExecutor if feature flag enabled
+        from .config import get_settings as _get_settings
+        if not getattr(_get_settings(), "ENABLE_PLAN_EXECUTOR", False):
+            # short-circuit to preserve current single-call behavior
+            return {}
+        from reasoner_service.plan_executor import PlanExecutor, ExecutionContext
+        pe = PlanExecutor(self)
+        # ensure ExecutionContext type if caller passed raw data
+        if not isinstance(execution_ctx, ExecutionContext):
+            # assume execution_ctx is compatible dict-like
+            execution_ctx = ExecutionContext(
+                orch=self,
+                signal=execution_ctx.get("signal", {}),
+                decision=execution_ctx.get("decision", {}),
+                corr_id=execution_ctx.get("corr_id", "no-corr")
+            )
+        return await pe.run_plan(plan, execution_ctx)
+
     async def process_decision(self, decision: Dict[str, Any], persist: bool = True, channels: Optional[List[str]] = None) -> Dict[str, Any]:
+        # Policy gate: pre-reasoning hook (placeholder)
+        try:
+            # pass the raw incoming snapshot as-is; state/ctx are intentionally empty for now
+            _ = self.pre_reasoning_policy_check(decision, state={}, ctx=None)
+        except Exception as e:
+            logger.exception("pre_reasoning_policy_check error: %s", e)
+
         d = self._normalize_decision(decision)
+        # Policy gate: post-reasoning hook (placeholder)
+        try:
+            # pass the normalized decision as the reasoning output
+            _ = self.post_reasoning_policy_check(d, state={}, ctx=None)
+        except Exception as e:
+            logger.exception("post_reasoning_policy_check error: %s", e)
         symbol = d["symbol"]
         rec = d.get("recommendation")
         conf = float(d.get("confidence", 0.0))
@@ -363,6 +438,59 @@ class DecisionOrchestrator:
                 notify_results[ch] = {"ok": False, "skipped": True}
 
         return {"id": dec_id, "skipped": skipped, "notify_results": notify_results}
+
+    async def notify(self, channel: str, payload: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Adapter to route a single notification through configured notifiers.
+
+        Delegates to existing notifier infrastructure; preserves existing behavior.
+        """
+        notifier = self.notifiers.get(channel)
+        if not notifier:
+            return {"ok": False, "error": "unconfigured"}
+        try:
+            decision_id = None
+            if isinstance(ctx, dict):
+                decision_id = ctx.get("decision_id") or ctx.get("id")
+            res = await notifier.notify(payload, decision_id=decision_id)
+            return res
+        except Exception as e:
+            logger.exception("notify adapter error: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    async def publish_to_dlq(self, payload: Dict[str, Any]) -> bool:
+        """Adapter to publish a payload to the orchestrator's DLQ fallback.
+
+        This will use Redis DLQ if configured and available, otherwise append to the
+        in-memory DLQ. Returns True on success, False otherwise.
+        """
+        try:
+            entry = {"decision": payload, "error": "published_via_adapter", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": 0.0}
+            if _cfg.REDIS_DLQ_ENABLED and getattr(self, "_redis", None) is not None:
+                try:
+                    from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
+                    await redis_op(self, lambda r, key, v: r.rpush(key, v), _cfg.REDIS_DLQ_KEY, json.dumps(entry))
+                    try:
+                        llen = await redis_op(self, lambda r, key: r.llen(key), _cfg.REDIS_DLQ_KEY)
+                        try:
+                            dlq_size.set(llen)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    # fallthrough to in-memory fallback
+                    logger.exception("redis dlq push failed, falling back to in-memory")
+            async with self._dlq_lock:
+                self._persist_dlq.append(entry)
+                try:
+                    dlq_size.set(len(self._persist_dlq))
+                except Exception:
+                    pass
+            return True
+        except Exception as e:
+            logger.exception("publish_to_dlq adapter error: %s", e)
+            return False
 
     async def run_from_queue(self, queue: asyncio.Queue, stop_event: Optional[asyncio.Event] = None) -> None:
         while True:

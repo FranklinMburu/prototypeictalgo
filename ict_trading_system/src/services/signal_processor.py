@@ -136,6 +136,25 @@ async def signal_worker():
 
                 # --- AI analysis ---
                 ai_result = analyze_signal(signal_data)
+                # If AI returned a plan, attempt to execute it via orchestrator adapter.
+                # This is gated by a feature flag in reasoner_service.config (disabled by default).
+                try:
+                    from reasoner_service.orchestrator import DecisionOrchestrator
+                    # create minimal execution context and delegate; the orchestrator method
+                    # is a no-op when feature flag disabled so this is safe in default runs.
+                    if isinstance(ai_result, dict) and "plan" in ai_result and isinstance(ai_result["plan"], dict):
+                        orch = DecisionOrchestrator()
+                        exec_ctx = {"signal": signal_data, "decision": ai_result, "corr_id": f"signal-{db_signal.id}"}
+                        # call and attach results if any
+                        try:
+                            plan_results = await orch.execute_plan_if_enabled(ai_result["plan"], exec_ctx)
+                            if plan_results:
+                                ai_result["plan_results"] = plan_results
+                        except Exception as e:
+                            logger.exception("Error executing plan: %s", e)
+                except Exception:
+                    # import or execution errors shouldn't block normal processing
+                    logger.debug("Plan executor not available or failed; continuing")
                 # Handle both legacy and repaired JSON formats
                 gpt_analysis = ai_result['content'] if 'content' in ai_result else str(ai_result)
 
