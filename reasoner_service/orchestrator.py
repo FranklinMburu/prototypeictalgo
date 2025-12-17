@@ -7,7 +7,6 @@ from typing import Optional, Dict, Any, List
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timezone
 
-
 from .config import get_settings
 try:
     import redis.asyncio as aioredis
@@ -21,6 +20,40 @@ from utils.redis_wrapper import redis_op
 
 _cfg = get_settings()
 
+
+class PolicyStore:
+    """Simple PolicyStore interface.
+
+    Implementations should provide async `get_policy(policy_name, context)`.
+    The default implementation below falls back to reading markers from the
+    provided `context` when no authoritative policy config is available on
+    the orchestrator. This keeps behavior backward-compatible for tests.
+    """
+    def __init__(self, orch: "DecisionOrchestrator"):
+        self.orch = orch
+
+    async def get_policy(self, policy_name: str, context: dict) -> dict:
+        # Try orchestrator-level policy config first
+        try:
+            cfg_obj = getattr(self.orch, "_policy_config", None)
+            if cfg_obj and policy_name in cfg_obj:
+                return cfg_obj.get(policy_name) or {}
+        except Exception:
+            pass
+
+        # Fallback: derive policy values from context markers (preserve legacy behavior)
+        if policy_name == "killzone":
+            return {"active": bool(context.get("killzone", False))}
+        if policy_name == "regime":
+            return {"regime": context.get("regime")}
+        if policy_name == "cooldown":
+            return {"cooldown_until": int(context.get("cooldown_until", 0) or 0)}
+        if policy_name == "exposure":
+            return {"exposure": float(context.get("exposure", 0) or 0), "max_exposure": float(context.get("max_exposure", 0) or 0)}
+        if policy_name == "confidence_threshold":
+            # default minimum confidence for 'enter' decisions
+            return {"min_confidence": 0.5}
+        return {}
 
 
 class DecisionOrchestrator:
@@ -75,6 +108,11 @@ class DecisionOrchestrator:
                 return {"error": str(e)}
 
         self.reasoner = SimpleNamespace(call=_reasoner_call)
+        # attach default policy store (can be overridden in tests)
+        self.policy_store = PolicyStore(self)
+        # policy counters and audit (permissive by default; enabled for Level-2 enforcement)
+        self._policy_counters = {"pass": 0, "veto": 0, "defer": 0}
+        self._policy_audit = []
 
     # --- Safety helper: normalized dedup key ---
     def _compute_dedup_key(self, decision: Dict[str, Any]) -> str:
@@ -109,23 +147,211 @@ class DecisionOrchestrator:
         ts_bucket = int((ts_ms // 1000) // bucket_s)
         return f"norm:{symbol}:{rec}:{conf}:{ts_bucket}"
 
-    # --- Policy gate scaffolding (placeholders) ---
-    def pre_reasoning_policy_check(self, snapshot: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Pre-reasoning policy gate (placeholder).
+    # --- Policy gate: pre-reasoning hook ---
+    async def pre_reasoning_policy_check(self, snapshot: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Pre-reasoning policy gate: checks markers for veto/defer.
 
-        This hook is intentionally permissive and returns a PASS result unconditionally.
-        It exists to make the pre-reasoning validation point explicit for future
-        policy enforcement (Level 2) work. It must not alter or veto execution.
+        This hook consults the PolicyStore for authoritative policy values; falls back
+        to context markers when PolicyStore unavailable. Respects ENABLE_PERMISSIVE_POLICY.
         """
+        # Respect permissive mode via feature flag: when enabled, policy checks are no-op
+        try:
+            cfg = get_settings()
+            if getattr(cfg, "ENABLE_PERMISSIVE_POLICY", True):
+                return {"result": "pass"}
+        except Exception:
+            return {"result": "pass"}
+
+        if not isinstance(snapshot, dict):
+            return {"result": "pass"}
+
+        # Check killzone via PolicyStore (with marker fallback)
+        try:
+            killzone_policy = await self.policy_store.get_policy("killzone", snapshot or {})
+            if killzone_policy.get("active"):
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "killzone", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (killzone): %s", entry)
+                return {"result": "veto", "reason": "killzone"}
+        except Exception:
+            # fallback to marker behavior
+            if snapshot.get("killzone"):
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "killzone", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (killzone marker): %s", entry)
+                return {"result": "veto", "reason": "killzone"}
+
+        # Check regime via PolicyStore
+        try:
+            regime_policy = await self.policy_store.get_policy("regime", snapshot or {})
+            if regime_policy.get("regime") == "restricted":
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "regime_restricted", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (regime): %s", entry)
+                return {"result": "veto", "reason": "regime_restricted"}
+        except Exception:
+            if snapshot.get("regime") == "restricted":
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "regime_restricted", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (regime marker): %s", entry)
+                return {"result": "veto", "reason": "regime_restricted"}
+
+        # Check cooldown via PolicyStore
+        try:
+            cooldown_policy = await self.policy_store.get_policy("cooldown", snapshot or {})
+            cooldown = int(cooldown_policy.get("cooldown_until", 0) or 0)
+            now_ms = int(time.time() * 1000)
+            if cooldown and cooldown > now_ms:
+                # record defer and enqueue to in-memory DLQ for retry
+                self._policy_counters["defer"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "defer", "reason": "cooldown", "next_attempt_ts": cooldown, "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.info("Policy defer scheduled (cooldown): %s", entry)
+                # append DLQ entry for retry (best-effort, non-blocking)
+                try:
+                    dlq_entry = {"decision": snapshot, "error": "policy_defer", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": cooldown}
+                    try:
+                        self._persist_dlq.append(dlq_entry)
+                        try:
+                            dlq_size.set(len(self._persist_dlq))
+                        except Exception:
+                            pass
+                    except Exception:
+                        self._persist_dlq.append(dlq_entry)
+                except Exception:
+                    logger.exception("failed to append policy-defer to in-memory DLQ")
+                return {"result": "defer", "reason": "cooldown", "next_attempt_ts": cooldown}
+        except Exception:
+            # fallback to marker behavior
+            try:
+                now_ms = int(time.time() * 1000)
+                cooldown = int(snapshot.get("cooldown_until", 0) or 0)
+                if cooldown and cooldown > now_ms:
+                    self._policy_counters["defer"] += 1
+                    entry = {"ts": int(time.time() * 1000), "action": "defer", "reason": "cooldown", "next_attempt_ts": cooldown, "id": snapshot.get("id")}
+                    try:
+                        self._policy_audit.append(entry)
+                    except Exception:
+                        pass
+                    logger.info("Policy defer scheduled (cooldown marker): %s", entry)
+                    try:
+                        dlq_entry = {"decision": snapshot, "error": "policy_defer", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": cooldown}
+                        try:
+                            self._persist_dlq.append(dlq_entry)
+                            try:
+                                dlq_size.set(len(self._persist_dlq))
+                            except Exception:
+                                pass
+                        except Exception:
+                            self._persist_dlq.append(dlq_entry)
+                    except Exception:
+                        logger.exception("failed to append policy-defer to in-memory DLQ (marker fallback)")
+                    return {"result": "defer", "reason": "cooldown", "next_attempt_ts": cooldown}
+            except Exception:
+                pass
+
+        # Check exposure via PolicyStore
+        try:
+            exp_policy = await self.policy_store.get_policy("exposure", snapshot or {})
+            exposure = float(exp_policy.get("exposure", 0) or 0)
+            max_exposure = float(exp_policy.get("max_exposure", 0) or 0)
+            if max_exposure and exposure > max_exposure:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure, "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (exposure): %s", entry)
+                return {"result": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure}
+        except Exception:
+            try:
+                exposure = float(snapshot.get("exposure", 0) or 0)
+                max_exposure = float(snapshot.get("max_exposure", 0) or 0)
+                if max_exposure and exposure > max_exposure:
+                    self._policy_counters["veto"] += 1
+                    entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure, "id": snapshot.get("id")}
+                    try:
+                        self._policy_audit.append(entry)
+                    except Exception:
+                        pass
+                    logger.warning("Policy veto applied (exposure marker): %s", entry)
+                    return {"result": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure}
+            except Exception:
+                pass
+
+        self._policy_counters["pass"] += 1
         return {"result": "pass"}
 
-    def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Post-reasoning policy gate (placeholder).
+    # --- Policy gate: post-reasoning hook ---
+    async def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Post-reasoning policy gate: checks confidence and other advisory outputs.
 
-        This hook is intentionally permissive and returns a PASS result unconditionally.
-        It exists as a clear location for future policy decisions without changing
-        current orchestrator behavior.
+        This hook consults PolicyStore for confidence thresholds and can veto low-confidence
+        enter decisions. Respects ENABLE_PERMISSIVE_POLICY.
         """
+        # Respect permissive mode via feature flag
+        try:
+            cfg = get_settings()
+            if getattr(cfg, "ENABLE_PERMISSIVE_POLICY", True):
+                return {"result": "pass"}
+        except Exception:
+            return {"result": "pass"}
+
+        if not isinstance(reasoning_output, dict):
+            return {"result": "pass"}
+
+        # Example veto paths based on recommendation or confidence; consult PolicyStore
+        rec = str(reasoning_output.get("recommendation", "")).lower()
+        try:
+            confidence = float(reasoning_output.get("confidence", 0) or 0)
+        except Exception:
+            confidence = 0
+
+        try:
+            conf_policy = await self.policy_store.get_policy("confidence_threshold", reasoning_output or {})
+            min_conf = float(conf_policy.get("min_confidence", 0.5) or 0.5)
+            if rec == "enter" and confidence < min_conf:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "low_confidence", "confidence": confidence, "id": reasoning_output.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (confidence): %s", entry)
+                return {"result": "veto", "reason": "low_confidence"}
+        except Exception:
+            if rec == "enter" and confidence < 0.5:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "low_confidence", "confidence": confidence, "id": reasoning_output.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (confidence marker): %s", entry)
+                return {"result": "veto", "reason": "low_confidence"}
+
+        # Allow other advisory outputs
+        self._policy_counters["pass"] += 1
         return {"result": "pass"}
 
     async def setup(self):
@@ -223,6 +449,7 @@ class DecisionOrchestrator:
             tags = [t.strip() for t in tags.split(",") if t.strip()]
         d["tags"] = list(tags)
         return d
+
     def _in_override_window(self, override: Dict[str, Any], now_utc: Optional[datetime] = None) -> bool:
         now = now_utc or datetime.utcnow()
         try:
@@ -307,7 +534,7 @@ class DecisionOrchestrator:
         # Policy gate: pre-reasoning hook (placeholder)
         try:
             # pass the raw incoming snapshot as-is; state/ctx are intentionally empty for now
-            _ = self.pre_reasoning_policy_check(decision, state={}, ctx=None)
+            _ = await self.pre_reasoning_policy_check(decision, state={}, ctx=None)
         except Exception as e:
             logger.exception("pre_reasoning_policy_check error: %s", e)
 
@@ -315,7 +542,7 @@ class DecisionOrchestrator:
         # Policy gate: post-reasoning hook (placeholder)
         try:
             # pass the normalized decision as the reasoning output
-            _ = self.post_reasoning_policy_check(d, state={}, ctx=None)
+            _ = await self.post_reasoning_policy_check(d, state={}, ctx=None)
         except Exception as e:
             logger.exception("post_reasoning_policy_check error: %s", e)
         symbol = d["symbol"]
@@ -501,6 +728,48 @@ class DecisionOrchestrator:
             except asyncio.TimeoutError:
                 continue
             try:
+                # Policy gate: allow pre-reasoning hook to observe incoming snapshot
+                try:
+                    await self.pre_reasoning_policy_check(decision, state={}, ctx=None)
+                except Exception as e:
+                    logger.exception("pre_reasoning_policy_check in run_from_queue failed: %s", e)
+
+                # If the queued item contains a plan, attempt PlanExecutor integration.
+                if isinstance(decision, dict) and decision.get("plan") is not None:
+                    plan = decision.get("plan")
+                    # Build a minimal execution context if provided
+                    exec_ctx = decision.get("execution_ctx") or {
+                        "signal": decision.get("signal", {}),
+                        "decision": decision,
+                        "corr_id": decision.get("corr_id", "no-corr"),
+                    }
+                    try:
+                        # Delegate to existing adapter which will honor feature flags
+                        pe_res = await self.execute_plan_if_enabled(plan, exec_ctx)
+                        # Capture plan result in the decision for downstream processing
+                        try:
+                            decision["_plan_result"] = pe_res
+                        except Exception:
+                            pass
+                        # Post-reasoning policy hook (consult PolicyStore)
+                        try:
+                            await self.post_reasoning_policy_check(pe_res, state={}, ctx=None)
+                        except Exception as e:
+                            logger.exception("post_reasoning_policy_check failed: %s", e)
+                    except Exception as e:
+                        logger.exception("PlanExecutor integration failed: %s", e)
+                        # On failure, publish to DLQ and notify, but do not crash the loop
+                        try:
+                            await self.publish_to_dlq(decision)
+                        except Exception:
+                            logger.exception("publish_to_dlq failed while handling plan error")
+                        try:
+                            # best-effort notify about the failure
+                            await self.notify("slack", {"error": str(e), "decision": decision}, ctx=None)
+                        except Exception:
+                            logger.exception("notify failed while handling plan error")
+
+                # Continue with normal processing of the (possibly augmented) decision
                 await self.process_decision(decision)
             except Exception:
                 logger.exception("error processing decision")
@@ -513,13 +782,13 @@ class DecisionOrchestrator:
     async def close(self):
         # stop DLQ retry task
         if self._dlq_task:
-                try:
-                    self._dlq_task.cancel()
-                    await self._dlq_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.exception("error stopping DLQ task")
+            try:
+                self._dlq_task.cancel()
+                await self._dlq_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("error stopping DLQ task")
         # close redis client if present
         if self._redis:
             try:
@@ -635,23 +904,23 @@ class DecisionOrchestrator:
         entries = []
         # If redis DLQ enabled, pop one entry atomically (using LPOP) and process
         if _cfg.REDIS_DLQ_ENABLED and self._redis is not None:
+            try:
+                from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
+                # use LPOP to get oldest entry
+                _raw_res = await redis_op(self, lambda r, key: r.lpop(key), _cfg.REDIS_DLQ_KEY)
+                raw = _raw_res.get("value") if isinstance(_raw_res, dict) else _raw_res
+                if raw is None:
+                    return
                 try:
-                    from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
-                    # use LPOP to get oldest entry
-                    _raw_res = await redis_op(self, lambda r, key: r.lpop(key), _cfg.REDIS_DLQ_KEY)
-                    raw = _raw_res.get("value") if isinstance(_raw_res, dict) else _raw_res
-                    if raw is None:
-                        return
-                    try:
-                        entry = json.loads(raw)
-                    except Exception:
-                        logger.exception("invalid DLQ entry in redis, skipping")
-                        return
-                    entries = [entry]
-                except (RedisUnavailable, RedisOpFailed):
-                    logger.exception("error reading from redis DLQ, falling back to in-memory for this iteration")
-                    async with self._dlq_lock:
-                        entries = list(self._persist_dlq)
+                    entry = json.loads(raw)
+                except Exception:
+                    logger.exception("invalid DLQ entry in redis, skipping")
+                    return
+                entries = [entry]
+            except (RedisUnavailable, RedisOpFailed):
+                logger.exception("error reading from redis DLQ, falling back to in-memory for this iteration")
+                async with self._dlq_lock:
+                    entries = list(self._persist_dlq)
         else:
             # copy indices to avoid mutation during iteration
             async with self._dlq_lock:
@@ -725,6 +994,6 @@ class DecisionOrchestrator:
                         logger.warning("DLQ retry failed for symbol=%s attempts=%d next_attempt_in=%.1fs error=%s", decision.get("symbol"), attempts, delay, str(e))
             except Exception:
                 logger.exception("unexpected error processing DLQ entry")
-                
-                
-                
+
+
+
