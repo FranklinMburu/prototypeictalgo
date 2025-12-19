@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timezone
 
 from .config import get_settings
+from .plan_execution_schemas import Plan, ExecutionContext, PlanResult, PlanExecutor
+from .orchestrator_events import Event, EventResult
+from .reasoning_manager import ReasoningManager, AdvisorySignal
+from .orchestration_advanced import (
+    OrchestrationStateManager, CooldownConfig, SessionWindow,
+    SignalFilter, EventState
+)
 try:
     import redis.asyncio as aioredis
 except Exception:
@@ -120,6 +127,14 @@ class DecisionOrchestrator:
         # policy counters and audit (permissive by default; enabled for Level-2 enforcement)
         self._policy_counters = {"pass": 0, "veto": 0, "defer": 0}
         self._policy_audit = []
+        # reasoning manager for bounded advisory signal generation
+        self.reasoning_manager: Optional[ReasoningManager] = None
+        # advanced event-driven orchestration
+        self.orchestration_state = OrchestrationStateManager()
+        self.signal_filter = SignalFilter(policy_store=self.policy_store)
+        # policy shadow mode for observational evaluation
+        from .policy_shadow_mode import get_shadow_mode_manager
+        self.shadow_mode_manager = get_shadow_mode_manager()
 
     # --- Safety helper: normalized dedup key ---
     def _compute_dedup_key(self, decision: Dict[str, Any]) -> str:
@@ -385,6 +400,19 @@ class DecisionOrchestrator:
         except Exception:
             logger.exception("error while configuring Redis DLQ")
 
+        # Initialize policy shadow mode for observational evaluation
+        try:
+            from .policy_shadow_mode import initialize_shadow_mode
+            from .outcome_stats import create_stats_service
+            stats_service = create_stats_service(self._sessionmaker or self.engine)
+            success = await initialize_shadow_mode(stats_service)
+            if success:
+                logger.info("Policy shadow mode initialized successfully")
+            else:
+                logger.warning("Policy shadow mode initialization failed or skipped")
+        except Exception:
+            logger.exception("Error initializing policy shadow mode (non-blocking)")
+
         # start DLQ retry loop if enabled (either redis or in-memory)
         try:
             if _cfg.DLQ_POLL_INTERVAL_SECONDS and (_cfg.REDIS_DLQ_ENABLED and self._redis is not None or _cfg.DLQ_POLL_INTERVAL_SECONDS):
@@ -518,24 +546,69 @@ class DecisionOrchestrator:
         # default fallback: all channels
         return ["slack", "discord", "telegram"]
 
-    async def execute_plan_if_enabled(self, plan: Dict[str, Any], execution_ctx) -> Dict[str, Any]:
-        # minimal adapter: delegates to PlanExecutor if feature flag enabled
+    async def execute_plan_if_enabled(self, plan: Dict[str, Any], execution_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a plan if enabled, returning a PlanResult.
+        
+        This method acts as the contract boundary between orchestrator and executor.
+        It accepts raw plan/context dicts and returns a PlanResult conforming to 
+        PLAN_EXECUTION_CONTRACT.md Section 3.
+        
+        Raises NotImplementedError: Plan execution logic not yet implemented.
+        """
         from .config import get_settings as _get_settings
+        
+        # Feature flag: if disabled, return empty dict for backward compatibility
         if not getattr(_get_settings(), "ENABLE_PLAN_EXECUTOR", False):
-            # short-circuit to preserve current single-call behavior
             return {}
-        from reasoner_service.plan_executor import PlanExecutor, ExecutionContext
-        pe = PlanExecutor(self)
-        # ensure ExecutionContext type if caller passed raw data
-        if not isinstance(execution_ctx, ExecutionContext):
-            # assume execution_ctx is compatible dict-like
-            execution_ctx = ExecutionContext(
-                orch=self,
-                signal=execution_ctx.get("signal", {}),
-                decision=execution_ctx.get("decision", {}),
-                corr_id=execution_ctx.get("corr_id", "no-corr")
-            )
-        return await pe.run_plan(plan, execution_ctx)
+        
+        # This is the contract boundary: attempt to construct contract-aligned structures.
+        # If this raises, it indicates the caller is not providing contract-compliant data.
+        try:
+            # Note: We do NOT validate here. Validation is the executor's responsibility
+            # per Contract Section 2 and Appendix. We only construct the data structures.
+            # Converting raw dicts to contract types for the executor.
+            
+            # Convert plan dict to Plan object (stub - no validation)
+            plan_obj = Plan(**plan) if isinstance(plan, dict) else plan
+            
+            # Convert execution context to ExecutionContext object (stub - no validation)  
+            if isinstance(execution_ctx, dict):
+                exec_ctx_obj = ExecutionContext(**execution_ctx)
+            else:
+                exec_ctx_obj = execution_ctx
+            
+            # Instantiate PlanExecutor and delegate
+            executor = PlanExecutor(orchestrator=self)
+            result: PlanResult = await executor.execute_plan(exec_ctx_obj)
+            
+            # Convert PlanResult back to dict for backward compatibility
+            # (Future: may return PlanResult directly once callers are updated)
+            return {
+                "plan_id": result.plan_id,
+                "execution_id": result.execution_id,
+                "status": result.status,
+                "completed_at": result.completed_at,
+                "duration_ms": result.duration_ms,
+                "steps_executed": result.steps_executed,
+                "steps_total": result.steps_total,
+                "result_payload": result.result_payload,
+                "error": {
+                    "error_code": result.error.error_code,
+                    "message": result.error.message,
+                    "step_id": result.error.step_id,
+                    "severity": result.error.severity,
+                    "recoverable": result.error.recoverable,
+                    "cause": result.error.cause,
+                    "context": result.error.context,
+                } if result.error else None,
+            }
+        except NotImplementedError:
+            # PlanExecutor raises NotImplementedError - propagate as-is
+            raise
+        except Exception as e:
+            logger.exception("execute_plan_if_enabled failed: %s", e)
+            # Return empty dict on unexpected errors (backward compatible)
+            return {}
 
     async def process_decision(self, decision: Dict[str, Any], persist: bool = True, channels: Optional[List[str]] = None) -> Dict[str, Any]:
         # Policy gate: pre-reasoning hook (placeholder)
@@ -552,6 +625,25 @@ class DecisionOrchestrator:
             _ = await self.post_reasoning_policy_check(d, state={}, ctx=None)
         except Exception as e:
             logger.exception("post_reasoning_policy_check error: %s", e)
+        
+        # SHADOW MODE: Evaluate policies in observation-only mode (non-blocking)
+        # Captures VETO decisions for audit trail, does NOT block execution
+        shadow_result = None
+        try:
+            from .policy_shadow_mode import evaluate_decision_shadow
+            shadow_result = await evaluate_decision_shadow(
+                d,
+                signal_type=d.get("signal_type"),
+                symbol=d.get("symbol"),
+                timeframe=d.get("timeframe"),
+            )
+            # Attach shadow result to decision for downstream logging/analysis
+            if shadow_result:
+                d["_shadow_policy_result"] = shadow_result
+        except Exception as e:
+            logger.exception("Shadow mode evaluation error (non-blocking): %s", e)
+            # CRITICAL: Never block execution due to shadow mode errors
+        
         symbol = d["symbol"]
         rec = d.get("recommendation")
         conf = float(d.get("confidence", 0.0))
@@ -785,6 +877,304 @@ class DecisionOrchestrator:
                     queue.task_done()
                 except Exception:
                     pass
+
+    # --- Advanced Event Orchestration Helpers ---
+
+    async def configure_cooldown(self, event_type: str, cooldown_ms: int) -> None:
+        """Configure cooldown for event type."""
+        config = CooldownConfig(event_type, cooldown_ms)
+        await self.orchestration_state.cooldown_manager.configure_cooldown(config)
+
+    async def configure_session_window(
+        self,
+        event_type: str,
+        start_hour: int = 0,
+        end_hour: int = 23,
+        max_events: int = 100
+    ) -> None:
+        """Configure session window for event type."""
+        window = SessionWindow(event_type, start_hour, end_hour, max_events)
+        await self.orchestration_state.cooldown_manager.configure_session_window(window)
+
+    async def _check_event_constraints(self, event_type: str) -> Tuple[bool, Optional[str], Optional[int]]:
+        """
+        Check event constraints (cooldown, session window, limits).
+        
+        Returns:
+            Tuple of (allowed, reason, next_available_ms)
+        """
+        # Check cooldown
+        is_cooling, next_available = await self.orchestration_state.cooldown_manager.check_cooldown(
+            event_type
+        )
+        if is_cooling:
+            return False, "cooldown_active", next_available
+
+        # Check session window
+        is_active = await self.orchestration_state.cooldown_manager.check_session_window(event_type)
+        if not is_active:
+            return False, "outside_session_window", None
+
+        # Check event limit
+        within_limit = await self.orchestration_state.cooldown_manager.check_event_limit(event_type)
+        if not within_limit:
+            return False, "event_limit_exceeded", None
+
+        return True, None, None
+
+    async def _apply_signal_filters(
+        self,
+        signals: List[Any],
+        event_type: str,
+        context: Dict[str, Any]
+    ) -> Tuple[List[Any], List[Dict[str, Any]]]:
+        """
+        Apply policy filters to advisory signals.
+        
+        Returns:
+            Tuple of (filtered_signals, policy_decisions_as_dicts)
+        """
+        filtered_signals, policy_decisions = await self.signal_filter.apply_policies(
+            signals, event_type, context
+        )
+        
+        # Convert policy decisions to dicts for metadata
+        decisions_dicts = [
+            {
+                "policy": d.policy_name,
+                "decision": d.decision,
+                "reason": d.reason,
+                "signals_filtered": d.signals_filtered,
+                "timestamp_ms": d.timestamp_ms
+            }
+            for d in policy_decisions
+        ]
+        
+        return filtered_signals, decisions_dicts
+
+    async def _record_event_metrics(
+        self,
+        status: str,
+        processing_time_ms: int,
+        reasoning_time_ms: int = 0
+    ) -> None:
+        """Record event and reasoning metrics."""
+        await self.orchestration_state.record_event_processing(status, processing_time_ms)
+        if reasoning_time_ms > 0:
+            await self.orchestration_state.record_reasoning_call(
+                success=(status == "accepted"),
+                execution_time_ms=reasoning_time_ms
+            )
+
+    async def get_orchestration_metrics(self) -> Dict[str, Any]:
+        """Get current orchestration metrics."""
+        orch_stats = await self.orchestration_state.get_orchestration_stats()
+        reasoning_stats = await self.orchestration_state.get_reasoning_stats()
+        
+        return {
+            "orchestration": orch_stats,
+            "reasoning": reasoning_stats
+        }
+
+    async def handle_event(self, event: Event) -> EventResult:
+        """Event-driven control loop for stateful orchestration.
+
+        Validates incoming events, enforces policies, routes to internal logic,
+        and maintains atomic state updates. Never directly executes trades.
+
+        Args:
+            event: Event object with type, payload, timestamp, correlation_id
+
+        Returns:
+            EventResult with status, reason, decision_id, and metadata
+        """
+        try:
+            # 1. Pre-Validation: Check event structure and system state
+            if not isinstance(event, Event):
+                return EventResult(status="error", reason="invalid_event_type")
+
+            if not event.event_type or not isinstance(event.payload, dict):
+                return EventResult(status="error", reason="malformed_event")
+
+            # Check system state constraints (cooldowns, session windows)
+            async with self._lock:
+                now_ms = int(time.time() * 1000)
+
+                # Check global cooldowns
+                if hasattr(self, '_global_cooldown_until') and self._global_cooldown_until > now_ms:
+                    return EventResult(
+                        status="deferred",
+                        reason="global_cooldown_active",
+                        metadata={"next_attempt_ts": self._global_cooldown_until}
+                    )
+
+                # Check session windows (quiet hours, etc.)
+                if self._is_quiet_hours():
+                    return EventResult(status="deferred", reason="quiet_hours_active")
+
+            # 2. Policy Check: Route based on event type and enforce constraints
+            if event.event_type == "decision":
+                # Route to existing decision processing
+                decision = event.payload
+                if not isinstance(decision, dict):
+                    return EventResult(status="error", reason="invalid_decision_payload")
+
+                # Apply pre-reasoning policy checks
+                policy_result = await self.pre_reasoning_policy_check(decision)
+                if policy_result.get("result") == "veto":
+                    return EventResult(
+                        status="rejected",
+                        reason=policy_result.get("reason", "policy_veto"),
+                        metadata={"policy_result": policy_result}
+                    )
+                elif policy_result.get("result") == "defer":
+                    return EventResult(
+                        status="deferred",
+                        reason=policy_result.get("reason", "policy_defer"),
+                        metadata={"policy_result": policy_result}
+                    )
+
+                # 2.5. Bounded Reasoning: Generate advisory signals if reasoning manager available
+                advisory_signals: List[AdvisorySignal] = []
+                advisory_errors: List[str] = []
+                if self.reasoning_manager is not None:
+                    try:
+                        decision_id = decision.get("id", event.correlation_id)
+                        reasoning_mode = decision.get("reasoning_mode", "default")
+                        plan_id = decision.get("plan", {}).get("id") if isinstance(decision.get("plan"), dict) else None
+                        
+                        # Create read-only execution context for reasoning
+                        reasoning_context: Dict[str, Any] = {
+                            "decision_id": decision_id,
+                            "timestamp": int(time.time() * 1000),
+                            "event_type": event.event_type,
+                            "correlation_id": event.correlation_id
+                        }
+                        
+                        # Call reasoning manager - never throws, always returns signals
+                        advisory_signals = await self.reasoning_manager.reason(
+                            decision_id=decision_id,
+                            event_payload=decision,
+                            execution_context=reasoning_context,
+                            reasoning_mode=reasoning_mode,
+                            plan_id=plan_id
+                        )
+                    except Exception as e:
+                        # Never fail orchestration on reasoning errors
+                        advisory_errors.append(f"reasoning_exception: {str(e)}")
+                        if self.logger:
+                            try:
+                                logger.warning("Reasoning manager exception (non-fatal): %s", e)
+                            except Exception:
+                                pass
+
+                # 3. Plan Execution: If decision contains plan, execute it
+                plan_result = None
+                if "plan" in decision and "execution_context" in decision:
+                    try:
+                        plan_result = await self.execute_plan_if_enabled(
+                            decision["plan"], decision["execution_context"]
+                        )
+                        # Post-validation: Check execution constraints
+                        if isinstance(plan_result, dict) and plan_result.get("status") == "failure":
+                            return EventResult(
+                                status="rejected",
+                                reason="plan_execution_failed",
+                                metadata={
+                                    "plan_result": plan_result,
+                                    "advisory_signals": [
+                                        {
+                                            "decision_id": s.decision_id,
+                                            "signal_type": s.signal_type,
+                                            "payload": s.payload,
+                                            "confidence": s.confidence
+                                        }
+                                        for s in advisory_signals
+                                    ],
+                                    "advisory_errors": advisory_errors
+                                }
+                            )
+                    except Exception as e:
+                        advisory_errors.append(f"plan_execution_error: {str(e)}")
+
+                # 4. Process the decision through normal flow
+                try:
+                    await self.process_decision(decision)
+                    decision_id = decision.get("id") or event.correlation_id
+                    return EventResult(
+                        status="accepted",
+                        decision_id=decision_id,
+                        metadata={
+                            "plan_result": plan_result,
+                            "advisory_signals": [
+                                {
+                                    "decision_id": s.decision_id,
+                                    "signal_type": s.signal_type,
+                                    "payload": s.payload,
+                                    "confidence": s.confidence,
+                                    "reasoning_mode": s.reasoning_mode,
+                                    "error": s.error
+                                }
+                                for s in advisory_signals
+                            ],
+                            "advisory_errors": advisory_errors
+                        }
+                    )
+                except Exception as e:
+                    return EventResult(
+                        status="error",
+                        reason=f"decision_processing_error: {str(e)}"
+                    )
+
+            elif event.event_type == "plan_execution":
+                # Direct plan execution request
+                if "plan" not in event.payload or "execution_context" not in event.payload:
+                    return EventResult(status="error", reason="missing_plan_or_context")
+
+                try:
+                    plan_result = await self.execute_plan_if_enabled(
+                        event.payload["plan"], event.payload["execution_context"]
+                    )
+                    if isinstance(plan_result, dict) and plan_result.get("status") == "failure":
+                        return EventResult(
+                            status="rejected",
+                            reason="plan_execution_failed",
+                            metadata={"plan_result": plan_result}
+                        )
+                    return EventResult(
+                        status="accepted",
+                        decision_id=event.correlation_id,
+                        metadata={"plan_result": plan_result}
+                    )
+                except Exception as e:
+                    return EventResult(
+                        status="error",
+                        reason=f"plan_execution_error: {str(e)}"
+                    )
+
+            else:
+                # Unknown event type
+                return EventResult(status="rejected", reason="unsupported_event_type")
+
+        except Exception as e:
+            # 5. State Update: Record any errors atomically
+            async with self._lock:
+                try:
+                    if not hasattr(self, '_event_errors'):
+                        self._event_errors = []
+                    self._event_errors.append({
+                        "ts": int(time.time() * 1000),
+                        "event_type": getattr(event, 'event_type', 'unknown'),
+                        "correlation_id": getattr(event, 'correlation_id', 'unknown'),
+                        "error": str(e)
+                    })
+                    # Keep only recent errors
+                    if len(self._event_errors) > 100:
+                        self._event_errors = self._event_errors[-100:]
+                except Exception:
+                    pass  # Never fail on error recording
+
+            return EventResult(status="error", reason=f"unexpected_error: {str(e)}")
 
     async def close(self):
         # stop DLQ retry task
