@@ -34,6 +34,8 @@ class Settings:
     # Feature toggles for Plan Executor
     ENABLE_PLAN_EXECUTOR: bool = bool(int(os.getenv("ENABLE_PLAN_EXECUTOR", "0")))
     DEBUG_PLAN_EXECUTOR: bool = bool(int(os.getenv("DEBUG_PLAN_EXECUTOR", "0")))
+    # Feature toggle for permissive policy mode (default: True)
+    ENABLE_PERMISSIVE_POLICY: bool = bool(int(os.getenv("ENABLE_PERMISSIVE_POLICY", "1")))
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
