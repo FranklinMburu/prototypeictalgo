@@ -9,7 +9,7 @@ from reasoner_service.policy_backends import (
     ChainedPolicyBackend,
     RedisPolicyBackend,
 )
-from reasoner_service.orchestrator import DecisionOrchestrator
+from reasoner_service.orchestrator import DecisionOrchestrator, PolicyStore
 
 
 class TestDefaultPolicyBackend:
