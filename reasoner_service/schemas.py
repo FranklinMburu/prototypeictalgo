@@ -74,3 +74,64 @@ decision_schema = {}
 
 # Explicitly export for test imports
 __all__ = ["Decision", "Triggers", "Versions"]
+
+# ============================================================================
+# DECISION OUTCOME SCHEMAS
+# ============================================================================
+# Pydantic models for decision outcome validation and serialization.
+# ============================================================================
+
+from datetime import datetime
+
+class DecisionOutcomeBase(BaseModel):
+    """Base schema for decision outcomes."""
+    decision_id: str
+    symbol: str
+    timeframe: str
+    signal_type: str
+    entry_price: float
+    exit_price: float
+    pnl: float
+    outcome: str  # "win", "loss", "breakeven"
+    exit_reason: str  # "tp", "sl", "manual", "timeout"
+    closed_at: datetime
+
+    @field_validator('outcome', mode='before')
+    @classmethod
+    def validate_outcome(cls, v):
+        if v not in ("win", "loss", "breakeven"):
+            raise ValueError(f"outcome must be 'win', 'loss', or 'breakeven', got '{v}'")
+        return v
+
+    @field_validator('exit_reason', mode='before')
+    @classmethod
+    def validate_exit_reason(cls, v):
+        if v not in ("tp", "sl", "manual", "timeout"):
+            raise ValueError(f"exit_reason must be 'tp', 'sl', 'manual', or 'timeout', got '{v}'")
+        return v
+
+    @field_validator('entry_price', 'exit_price', 'pnl', mode='before')
+    @classmethod
+    def validate_float_fields(cls, v):
+        try:
+            return float(v)
+        except Exception:
+            raise ValueError(f"Invalid float value: {v}")
+
+
+class DecisionOutcomeCreate(DecisionOutcomeBase):
+    """Schema for creating a new decision outcome."""
+    pass
+
+
+class DecisionOutcome(DecisionOutcomeBase):
+    """Schema for retrieving a decision outcome from storage."""
+    id: str
+    created_at: datetime
+
+    model_config = {
+        "from_attributes": True
+    }
+
+
+__all__ = ["Decision", "Triggers", "Versions", "DecisionOutcomeBase", "DecisionOutcomeCreate", "DecisionOutcome"]

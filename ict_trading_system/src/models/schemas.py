@@ -40,10 +40,17 @@ class TradeBase(BaseModel):
     entry_price: float
     sl: float
     tp: float
-    outcome: Optional[str]
-    pnl: Optional[float]
-    notes: Optional[str]
-    timestamp: Optional[datetime]
+    outcome: Optional[str] = None  # "win", "loss", "breakeven"
+    pnl: Optional[float] = None
+    notes: Optional[str] = None
+    timestamp: Optional[datetime] = None
+    
+    # Outcome-aware fields (new, optional)
+    # Enable symmetry with reasoner_service.DecisionOutcome
+    decision_id: Optional[str] = None  # UUID from reasoner_service.Decision
+    exit_price: Optional[float] = None  # Actual exit price (may differ from TP/SL)
+    exit_reason: Optional[str] = None  # "tp", "sl", "manual", "timeout"
+    closed_at: Optional[datetime] = None  # When trade closed
 
 class TradeCreate(TradeBase):
     pass
