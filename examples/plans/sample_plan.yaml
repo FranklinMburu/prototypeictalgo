@@ -1,0 +1,41 @@
+start: "step1"
+
+steps:
+  step1:
+    action: "call_ai"
+    parameters:
+      input: "Generate a summary"
+    on_success: "step2"
+    on_failure: "failure1"
+
+  step2:
+    action: "eval"
+    parameters:
+      expression: "len(results['step1'].output) > 0"
+    on_success: "step3"
+    on_failure: "failure2"
+
+  step3:
+    action: "notify"
+    parameters:
+      message: "Summary generated successfully."
+    on_success: "step4"
+
+  step4:
+    action: "wait"
+    parameters:
+      duration: 5
+
+failure1:
+  action: "notify"
+  parameters:
+    message: "Step 1 failed."
+
+failure2:
+  action: "notify"
+  parameters:
+    message: "Step 2 evaluation failed."
+
+variables:
+  s1.output: "Generated summary text"
+  s2.value: true

@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
+from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timezone
 
-
 from .config import get_settings
+from .plan_execution_schemas import Plan, ExecutionContext, PlanResult, PlanExecutor
+from .orchestrator_events import Event, EventResult
+from .reasoning_manager import ReasoningManager, AdvisorySignal
+from .orchestration_advanced import (
+    OrchestrationStateManager, CooldownConfig, SessionWindow,
+    SignalFilter, EventState
+)
 try:
     import redis.asyncio as aioredis
 except Exception:
@@ -20,6 +27,47 @@ from utils.redis_wrapper import redis_op
 
 _cfg = get_settings()
 
+
+class PolicyStore:
+    """Facade for pluggable policy backends with chained fallback.
+
+    PolicyStore coordinates multiple backends (config, HTTP, Redis, markers)
+    and falls back through them in order until a policy is found. This enables
+    authoritative policy services while maintaining backward-compatibility.
+    """
+    def __init__(self, orch: "DecisionOrchestrator", backends=None):
+        """Initialize PolicyStore with optional custom backends.
+
+        Args:
+            orch: Reference to DecisionOrchestrator
+            backends: Optional list of PolicyBackend instances; if None, uses defaults
+        """
+        self.orch = orch
+        if backends is None:
+            # Default backend chain: orchestrator config -> marker fallback
+            from .policy_backends import OrchestratorConfigBackend, DefaultPolicyBackend
+            backends = [
+                OrchestratorConfigBackend(orch),
+                DefaultPolicyBackend(),
+            ]
+        self.backends = backends
+
+    async def get_policy(self, policy_name: str, context: dict) -> dict:
+        """Get policy from backends in priority order.
+
+        Tries each backend until one returns a non-empty result. This allows
+        orchestrator config to override markers, HTTP services to override local
+        config, and so on.
+        """
+        for backend in self.backends:
+            try:
+                result = await backend.get_policy(policy_name, context)
+                if result:  # Non-empty dict means policy found
+                    return result
+            except Exception:
+                continue
+        # Fallback: empty dict (policy not configured)
+        return {}
 
 
 class DecisionOrchestrator:
@@ -51,6 +99,42 @@ class DecisionOrchestrator:
         except Exception:
             self._routing_rules = {}
             self._routing_overrides = []
+        # Lightweight reasoner adapter exposing a coroutine `call(prompt, signal, decision)`.
+        # This delegates to the repository's existing reasoning path and does not bypass
+        # orchestration policy or enforcement.
+        async def _reasoner_call(prompt, signal=None, decision=None):
+            snap: Dict[str, Any] = {}
+            try:
+                if isinstance(signal, dict):
+                    snap.update(signal)
+                if isinstance(decision, dict):
+                    snap.update(decision)
+                if prompt is not None:
+                    # preserve prompt for downstream reasoner implementations
+                    snap.setdefault("prompt", prompt)
+                    snap.setdefault("summary", str(prompt))
+                # delegate to existing reasoning implementation
+                from .reasoner import reason_from_snapshot
+
+                return await reason_from_snapshot(snap)
+            except Exception as e:
+                logger.exception("reasoner adapter call failed: %s", e)
+                return {"error": str(e)}
+
+        self.reasoner = SimpleNamespace(call=_reasoner_call)
+        # attach default policy store (can be overridden in tests)
+        self.policy_store = PolicyStore(self)
+        # policy counters and audit (permissive by default; enabled for Level-2 enforcement)
+        self._policy_counters = {"pass": 0, "veto": 0, "defer": 0}
+        self._policy_audit = []
+        # reasoning manager for bounded advisory signal generation
+        self.reasoning_manager: Optional[ReasoningManager] = None
+        # advanced event-driven orchestration
+        self.orchestration_state = OrchestrationStateManager()
+        self.signal_filter = SignalFilter(policy_store=self.policy_store)
+        # policy shadow mode for observational evaluation
+        from .policy_shadow_mode import get_shadow_mode_manager
+        self.shadow_mode_manager = get_shadow_mode_manager()
 
     # --- Safety helper: normalized dedup key ---
     def _compute_dedup_key(self, decision: Dict[str, Any]) -> str:
@@ -85,6 +169,213 @@ class DecisionOrchestrator:
         ts_bucket = int((ts_ms // 1000) // bucket_s)
         return f"norm:{symbol}:{rec}:{conf}:{ts_bucket}"
 
+    # --- Policy gate: pre-reasoning hook ---
+    async def pre_reasoning_policy_check(self, snapshot: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Pre-reasoning policy gate: checks markers for veto/defer.
+
+        This hook consults the PolicyStore for authoritative policy values; falls back
+        to context markers when PolicyStore unavailable. Respects ENABLE_PERMISSIVE_POLICY.
+        """
+        # Respect permissive mode via feature flag: when enabled, policy checks are no-op
+        try:
+            cfg = get_settings()
+            if getattr(cfg, "ENABLE_PERMISSIVE_POLICY", True):
+                return {"result": "pass"}
+        except Exception:
+            return {"result": "pass"}
+
+        if not isinstance(snapshot, dict):
+            return {"result": "pass"}
+
+        # Check killzone via PolicyStore (with marker fallback)
+        try:
+            killzone_policy = await self.policy_store.get_policy("killzone", snapshot or {})
+            if killzone_policy.get("active"):
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "killzone", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (killzone): %s", entry)
+                return {"result": "veto", "reason": "killzone"}
+        except Exception:
+            # fallback to marker behavior
+            if snapshot.get("killzone"):
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "killzone", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (killzone marker): %s", entry)
+                return {"result": "veto", "reason": "killzone"}
+
+        # Check regime via PolicyStore
+        try:
+            regime_policy = await self.policy_store.get_policy("regime", snapshot or {})
+            if regime_policy.get("regime") == "restricted":
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "regime_restricted", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (regime): %s", entry)
+                return {"result": "veto", "reason": "regime_restricted"}
+        except Exception:
+            if snapshot.get("regime") == "restricted":
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "regime_restricted", "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (regime marker): %s", entry)
+                return {"result": "veto", "reason": "regime_restricted"}
+
+        # Check cooldown via PolicyStore
+        try:
+            cooldown_policy = await self.policy_store.get_policy("cooldown", snapshot or {})
+            cooldown = int(cooldown_policy.get("cooldown_until", 0) or 0)
+            now_ms = int(time.time() * 1000)
+            if cooldown and cooldown > now_ms:
+                # record defer and enqueue to in-memory DLQ for retry
+                self._policy_counters["defer"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "defer", "reason": "cooldown", "next_attempt_ts": cooldown, "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.info("Policy defer scheduled (cooldown): %s", entry)
+                # append DLQ entry for retry (best-effort, non-blocking)
+                try:
+                    dlq_entry = {"decision": snapshot, "error": "policy_defer", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": cooldown}
+                    try:
+                        self._persist_dlq.append(dlq_entry)
+                        try:
+                            dlq_size.set(len(self._persist_dlq))
+                        except Exception:
+                            pass
+                    except Exception:
+                        self._persist_dlq.append(dlq_entry)
+                except Exception:
+                    logger.exception("failed to append policy-defer to in-memory DLQ")
+                return {"result": "defer", "reason": "cooldown", "next_attempt_ts": cooldown}
+        except Exception:
+            # fallback to marker behavior
+            try:
+                now_ms = int(time.time() * 1000)
+                cooldown = int(snapshot.get("cooldown_until", 0) or 0)
+                if cooldown and cooldown > now_ms:
+                    self._policy_counters["defer"] += 1
+                    entry = {"ts": int(time.time() * 1000), "action": "defer", "reason": "cooldown", "next_attempt_ts": cooldown, "id": snapshot.get("id")}
+                    try:
+                        self._policy_audit.append(entry)
+                    except Exception:
+                        pass
+                    logger.info("Policy defer scheduled (cooldown marker): %s", entry)
+                    try:
+                        dlq_entry = {"decision": snapshot, "error": "policy_defer", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": cooldown}
+                        try:
+                            self._persist_dlq.append(dlq_entry)
+                            try:
+                                dlq_size.set(len(self._persist_dlq))
+                            except Exception:
+                                pass
+                        except Exception:
+                            self._persist_dlq.append(dlq_entry)
+                    except Exception:
+                        logger.exception("failed to append policy-defer to in-memory DLQ (marker fallback)")
+                    return {"result": "defer", "reason": "cooldown", "next_attempt_ts": cooldown}
+            except Exception:
+                pass
+
+        # Check exposure via PolicyStore
+        try:
+            exp_policy = await self.policy_store.get_policy("exposure", snapshot or {})
+            exposure = float(exp_policy.get("exposure", 0) or 0)
+            max_exposure = float(exp_policy.get("max_exposure", 0) or 0)
+            if max_exposure and exposure > max_exposure:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure, "id": snapshot.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (exposure): %s", entry)
+                return {"result": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure}
+        except Exception:
+            try:
+                exposure = float(snapshot.get("exposure", 0) or 0)
+                max_exposure = float(snapshot.get("max_exposure", 0) or 0)
+                if max_exposure and exposure > max_exposure:
+                    self._policy_counters["veto"] += 1
+                    entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure, "id": snapshot.get("id")}
+                    try:
+                        self._policy_audit.append(entry)
+                    except Exception:
+                        pass
+                    logger.warning("Policy veto applied (exposure marker): %s", entry)
+                    return {"result": "veto", "reason": "risk_limit_exceeded", "exposure": exposure, "max_exposure": max_exposure}
+            except Exception:
+                pass
+
+        self._policy_counters["pass"] += 1
+        return {"result": "pass"}
+
+    # --- Policy gate: post-reasoning hook ---
+    async def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Post-reasoning policy gate: checks confidence and other advisory outputs.
+
+        This hook consults PolicyStore for confidence thresholds and can veto low-confidence
+        enter decisions. Respects ENABLE_PERMISSIVE_POLICY.
+        """
+        # Respect permissive mode via feature flag
+        try:
+            cfg = get_settings()
+            if getattr(cfg, "ENABLE_PERMISSIVE_POLICY", True):
+                return {"result": "pass"}
+        except Exception:
+            return {"result": "pass"}
+
+        if not isinstance(reasoning_output, dict):
+            return {"result": "pass"}
+
+        # Example veto paths based on recommendation or confidence; consult PolicyStore
+        rec = str(reasoning_output.get("recommendation", "")).lower()
+        try:
+            confidence = float(reasoning_output.get("confidence", 0) or 0)
+        except Exception:
+            confidence = 0
+
+        try:
+            conf_policy = await self.policy_store.get_policy("confidence_threshold", reasoning_output or {})
+            min_conf = float(conf_policy.get("min_confidence", 0.5) or 0.5)
+            if rec == "enter" and confidence < min_conf:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "low_confidence", "confidence": confidence, "id": reasoning_output.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (confidence): %s", entry)
+                return {"result": "veto", "reason": "low_confidence"}
+        except Exception:
+            if rec == "enter" and confidence < 0.5:
+                self._policy_counters["veto"] += 1
+                entry = {"ts": int(time.time() * 1000), "action": "veto", "reason": "low_confidence", "confidence": confidence, "id": reasoning_output.get("id")}
+                try:
+                    self._policy_audit.append(entry)
+                except Exception:
+                    pass
+                logger.warning("Policy veto applied (confidence marker): %s", entry)
+                return {"result": "veto", "reason": "low_confidence"}
+
+        # Allow other advisory outputs
+        self._policy_counters["pass"] += 1
+        return {"result": "pass"}
+
     async def setup(self):
         # Create async engine and sessionmaker pair. Use sessionmaker for persistence calls.
         try:
@@ -108,6 +399,19 @@ class DecisionOrchestrator:
                 await self._ensure_redis()
         except Exception:
             logger.exception("error while configuring Redis DLQ")
+
+        # Initialize policy shadow mode for observational evaluation
+        try:
+            from .policy_shadow_mode import initialize_shadow_mode
+            from .outcome_stats import create_stats_service
+            stats_service = create_stats_service(self._sessionmaker or self.engine)
+            success = await initialize_shadow_mode(stats_service)
+            if success:
+                logger.info("Policy shadow mode initialized successfully")
+            else:
+                logger.warning("Policy shadow mode initialization failed or skipped")
+        except Exception:
+            logger.exception("Error initializing policy shadow mode (non-blocking)")
 
         # start DLQ retry loop if enabled (either redis or in-memory)
         try:
@@ -180,6 +484,7 @@ class DecisionOrchestrator:
             tags = [t.strip() for t in tags.split(",") if t.strip()]
         d["tags"] = list(tags)
         return d
+
     def _in_override_window(self, override: Dict[str, Any], now_utc: Optional[datetime] = None) -> bool:
         now = now_utc or datetime.utcnow()
         try:
@@ -241,8 +546,104 @@ class DecisionOrchestrator:
         # default fallback: all channels
         return ["slack", "discord", "telegram"]
 
+    async def execute_plan_if_enabled(self, plan: Dict[str, Any], execution_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a plan if enabled, returning a PlanResult.
+        
+        This method acts as the contract boundary between orchestrator and executor.
+        It accepts raw plan/context dicts and returns a PlanResult conforming to 
+        PLAN_EXECUTION_CONTRACT.md Section 3.
+        
+        Raises NotImplementedError: Plan execution logic not yet implemented.
+        """
+        from .config import get_settings as _get_settings
+        
+        # Feature flag: if disabled, return empty dict for backward compatibility
+        if not getattr(_get_settings(), "ENABLE_PLAN_EXECUTOR", False):
+            return {}
+        
+        # This is the contract boundary: attempt to construct contract-aligned structures.
+        # If this raises, it indicates the caller is not providing contract-compliant data.
+        try:
+            # Note: We do NOT validate here. Validation is the executor's responsibility
+            # per Contract Section 2 and Appendix. We only construct the data structures.
+            # Converting raw dicts to contract types for the executor.
+            
+            # Convert plan dict to Plan object (stub - no validation)
+            plan_obj = Plan(**plan) if isinstance(plan, dict) else plan
+            
+            # Convert execution context to ExecutionContext object (stub - no validation)  
+            if isinstance(execution_ctx, dict):
+                exec_ctx_obj = ExecutionContext(**execution_ctx)
+            else:
+                exec_ctx_obj = execution_ctx
+            
+            # Instantiate PlanExecutor and delegate
+            executor = PlanExecutor(orchestrator=self)
+            result: PlanResult = await executor.execute_plan(exec_ctx_obj)
+            
+            # Convert PlanResult back to dict for backward compatibility
+            # (Future: may return PlanResult directly once callers are updated)
+            return {
+                "plan_id": result.plan_id,
+                "execution_id": result.execution_id,
+                "status": result.status,
+                "completed_at": result.completed_at,
+                "duration_ms": result.duration_ms,
+                "steps_executed": result.steps_executed,
+                "steps_total": result.steps_total,
+                "result_payload": result.result_payload,
+                "error": {
+                    "error_code": result.error.error_code,
+                    "message": result.error.message,
+                    "step_id": result.error.step_id,
+                    "severity": result.error.severity,
+                    "recoverable": result.error.recoverable,
+                    "cause": result.error.cause,
+                    "context": result.error.context,
+                } if result.error else None,
+            }
+        except NotImplementedError:
+            # PlanExecutor raises NotImplementedError - propagate as-is
+            raise
+        except Exception as e:
+            logger.exception("execute_plan_if_enabled failed: %s", e)
+            # Return empty dict on unexpected errors (backward compatible)
+            return {}
+
     async def process_decision(self, decision: Dict[str, Any], persist: bool = True, channels: Optional[List[str]] = None) -> Dict[str, Any]:
+        # Policy gate: pre-reasoning hook (placeholder)
+        try:
+            # pass the raw incoming snapshot as-is; state/ctx are intentionally empty for now
+            _ = await self.pre_reasoning_policy_check(decision, state={}, ctx=None)
+        except Exception as e:
+            logger.exception("pre_reasoning_policy_check error: %s", e)
+
         d = self._normalize_decision(decision)
+        # Policy gate: post-reasoning hook (placeholder)
+        try:
+            # pass the normalized decision as the reasoning output
+            _ = await self.post_reasoning_policy_check(d, state={}, ctx=None)
+        except Exception as e:
+            logger.exception("post_reasoning_policy_check error: %s", e)
+        
+        # SHADOW MODE: Evaluate policies in observation-only mode (non-blocking)
+        # Captures VETO decisions for audit trail, does NOT block execution
+        shadow_result = None
+        try:
+            from .policy_shadow_mode import evaluate_decision_shadow
+            shadow_result = await evaluate_decision_shadow(
+                d,
+                signal_type=d.get("signal_type"),
+                symbol=d.get("symbol"),
+                timeframe=d.get("timeframe"),
+            )
+            # Attach shadow result to decision for downstream logging/analysis
+            if shadow_result:
+                d["_shadow_policy_result"] = shadow_result
+        except Exception as e:
+            logger.exception("Shadow mode evaluation error (non-blocking): %s", e)
+            # CRITICAL: Never block execution due to shadow mode errors
+        
         symbol = d["symbol"]
         rec = d.get("recommendation")
         conf = float(d.get("confidence", 0.0))
@@ -364,6 +765,59 @@ class DecisionOrchestrator:
 
         return {"id": dec_id, "skipped": skipped, "notify_results": notify_results}
 
+    async def notify(self, channel: str, payload: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Adapter to route a single notification through configured notifiers.
+
+        Delegates to existing notifier infrastructure; preserves existing behavior.
+        """
+        notifier = self.notifiers.get(channel)
+        if not notifier:
+            return {"ok": False, "error": "unconfigured"}
+        try:
+            decision_id = None
+            if isinstance(ctx, dict):
+                decision_id = ctx.get("decision_id") or ctx.get("id")
+            res = await notifier.notify(payload, decision_id=decision_id)
+            return res
+        except Exception as e:
+            logger.exception("notify adapter error: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    async def publish_to_dlq(self, payload: Dict[str, Any]) -> bool:
+        """Adapter to publish a payload to the orchestrator's DLQ fallback.
+
+        This will use Redis DLQ if configured and available, otherwise append to the
+        in-memory DLQ. Returns True on success, False otherwise.
+        """
+        try:
+            entry = {"decision": payload, "error": "published_via_adapter", "ts": int(time.time() * 1000), "attempts": 0, "next_attempt_ts": 0.0}
+            if _cfg.REDIS_DLQ_ENABLED and getattr(self, "_redis", None) is not None:
+                try:
+                    from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
+                    await redis_op(self, lambda r, key, v: r.rpush(key, v), _cfg.REDIS_DLQ_KEY, json.dumps(entry))
+                    try:
+                        llen = await redis_op(self, lambda r, key: r.llen(key), _cfg.REDIS_DLQ_KEY)
+                        try:
+                            dlq_size.set(llen)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    # fallthrough to in-memory fallback
+                    logger.exception("redis dlq push failed, falling back to in-memory")
+            async with self._dlq_lock:
+                self._persist_dlq.append(entry)
+                try:
+                    dlq_size.set(len(self._persist_dlq))
+                except Exception:
+                    pass
+            return True
+        except Exception as e:
+            logger.exception("publish_to_dlq adapter error: %s", e)
+            return False
+
     async def run_from_queue(self, queue: asyncio.Queue, stop_event: Optional[asyncio.Event] = None) -> None:
         while True:
             if stop_event and stop_event.is_set():
@@ -373,6 +827,48 @@ class DecisionOrchestrator:
             except asyncio.TimeoutError:
                 continue
             try:
+                # Policy gate: allow pre-reasoning hook to observe incoming snapshot
+                try:
+                    await self.pre_reasoning_policy_check(decision, state={}, ctx=None)
+                except Exception as e:
+                    logger.exception("pre_reasoning_policy_check in run_from_queue failed: %s", e)
+
+                # If the queued item contains a plan, attempt PlanExecutor integration.
+                if isinstance(decision, dict) and decision.get("plan") is not None:
+                    plan = decision.get("plan")
+                    # Build a minimal execution context if provided
+                    exec_ctx = decision.get("execution_ctx") or {
+                        "signal": decision.get("signal", {}),
+                        "decision": decision,
+                        "corr_id": decision.get("corr_id", "no-corr"),
+                    }
+                    try:
+                        # Delegate to existing adapter which will honor feature flags
+                        pe_res = await self.execute_plan_if_enabled(plan, exec_ctx)
+                        # Capture plan result in the decision for downstream processing
+                        try:
+                            decision["_plan_result"] = pe_res
+                        except Exception:
+                            pass
+                        # Post-reasoning policy hook (consult PolicyStore)
+                        try:
+                            await self.post_reasoning_policy_check(pe_res, state={}, ctx=None)
+                        except Exception as e:
+                            logger.exception("post_reasoning_policy_check failed: %s", e)
+                    except Exception as e:
+                        logger.exception("PlanExecutor integration failed: %s", e)
+                        # On failure, publish to DLQ and notify, but do not crash the loop
+                        try:
+                            await self.publish_to_dlq(decision)
+                        except Exception:
+                            logger.exception("publish_to_dlq failed while handling plan error")
+                        try:
+                            # best-effort notify about the failure
+                            await self.notify("slack", {"error": str(e), "decision": decision}, ctx=None)
+                        except Exception:
+                            logger.exception("notify failed while handling plan error")
+
+                # Continue with normal processing of the (possibly augmented) decision
                 await self.process_decision(decision)
             except Exception:
                 logger.exception("error processing decision")
@@ -382,16 +878,314 @@ class DecisionOrchestrator:
                 except Exception:
                     pass
 
+    # --- Advanced Event Orchestration Helpers ---
+
+    async def configure_cooldown(self, event_type: str, cooldown_ms: int) -> None:
+        """Configure cooldown for event type."""
+        config = CooldownConfig(event_type, cooldown_ms)
+        await self.orchestration_state.cooldown_manager.configure_cooldown(config)
+
+    async def configure_session_window(
+        self,
+        event_type: str,
+        start_hour: int = 0,
+        end_hour: int = 23,
+        max_events: int = 100
+    ) -> None:
+        """Configure session window for event type."""
+        window = SessionWindow(event_type, start_hour, end_hour, max_events)
+        await self.orchestration_state.cooldown_manager.configure_session_window(window)
+
+    async def _check_event_constraints(self, event_type: str) -> Tuple[bool, Optional[str], Optional[int]]:
+        """
+        Check event constraints (cooldown, session window, limits).
+        
+        Returns:
+            Tuple of (allowed, reason, next_available_ms)
+        """
+        # Check cooldown
+        is_cooling, next_available = await self.orchestration_state.cooldown_manager.check_cooldown(
+            event_type
+        )
+        if is_cooling:
+            return False, "cooldown_active", next_available
+
+        # Check session window
+        is_active = await self.orchestration_state.cooldown_manager.check_session_window(event_type)
+        if not is_active:
+            return False, "outside_session_window", None
+
+        # Check event limit
+        within_limit = await self.orchestration_state.cooldown_manager.check_event_limit(event_type)
+        if not within_limit:
+            return False, "event_limit_exceeded", None
+
+        return True, None, None
+
+    async def _apply_signal_filters(
+        self,
+        signals: List[Any],
+        event_type: str,
+        context: Dict[str, Any]
+    ) -> Tuple[List[Any], List[Dict[str, Any]]]:
+        """
+        Apply policy filters to advisory signals.
+        
+        Returns:
+            Tuple of (filtered_signals, policy_decisions_as_dicts)
+        """
+        filtered_signals, policy_decisions = await self.signal_filter.apply_policies(
+            signals, event_type, context
+        )
+        
+        # Convert policy decisions to dicts for metadata
+        decisions_dicts = [
+            {
+                "policy": d.policy_name,
+                "decision": d.decision,
+                "reason": d.reason,
+                "signals_filtered": d.signals_filtered,
+                "timestamp_ms": d.timestamp_ms
+            }
+            for d in policy_decisions
+        ]
+        
+        return filtered_signals, decisions_dicts
+
+    async def _record_event_metrics(
+        self,
+        status: str,
+        processing_time_ms: int,
+        reasoning_time_ms: int = 0
+    ) -> None:
+        """Record event and reasoning metrics."""
+        await self.orchestration_state.record_event_processing(status, processing_time_ms)
+        if reasoning_time_ms > 0:
+            await self.orchestration_state.record_reasoning_call(
+                success=(status == "accepted"),
+                execution_time_ms=reasoning_time_ms
+            )
+
+    async def get_orchestration_metrics(self) -> Dict[str, Any]:
+        """Get current orchestration metrics."""
+        orch_stats = await self.orchestration_state.get_orchestration_stats()
+        reasoning_stats = await self.orchestration_state.get_reasoning_stats()
+        
+        return {
+            "orchestration": orch_stats,
+            "reasoning": reasoning_stats
+        }
+
+    async def handle_event(self, event: Event) -> EventResult:
+        """Event-driven control loop for stateful orchestration.
+
+        Validates incoming events, enforces policies, routes to internal logic,
+        and maintains atomic state updates. Never directly executes trades.
+
+        Args:
+            event: Event object with type, payload, timestamp, correlation_id
+
+        Returns:
+            EventResult with status, reason, decision_id, and metadata
+        """
+        try:
+            # 1. Pre-Validation: Check event structure and system state
+            if not isinstance(event, Event):
+                return EventResult(status="error", reason="invalid_event_type")
+
+            if not event.event_type or not isinstance(event.payload, dict):
+                return EventResult(status="error", reason="malformed_event")
+
+            # Check system state constraints (cooldowns, session windows)
+            async with self._lock:
+                now_ms = int(time.time() * 1000)
+
+                # Check global cooldowns
+                if hasattr(self, '_global_cooldown_until') and self._global_cooldown_until > now_ms:
+                    return EventResult(
+                        status="deferred",
+                        reason="global_cooldown_active",
+                        metadata={"next_attempt_ts": self._global_cooldown_until}
+                    )
+
+                # Check session windows (quiet hours, etc.)
+                if self._is_quiet_hours():
+                    return EventResult(status="deferred", reason="quiet_hours_active")
+
+            # 2. Policy Check: Route based on event type and enforce constraints
+            if event.event_type == "decision":
+                # Route to existing decision processing
+                decision = event.payload
+                if not isinstance(decision, dict):
+                    return EventResult(status="error", reason="invalid_decision_payload")
+
+                # Apply pre-reasoning policy checks
+                policy_result = await self.pre_reasoning_policy_check(decision)
+                if policy_result.get("result") == "veto":
+                    return EventResult(
+                        status="rejected",
+                        reason=policy_result.get("reason", "policy_veto"),
+                        metadata={"policy_result": policy_result}
+                    )
+                elif policy_result.get("result") == "defer":
+                    return EventResult(
+                        status="deferred",
+                        reason=policy_result.get("reason", "policy_defer"),
+                        metadata={"policy_result": policy_result}
+                    )
+
+                # 2.5. Bounded Reasoning: Generate advisory signals if reasoning manager available
+                advisory_signals: List[AdvisorySignal] = []
+                advisory_errors: List[str] = []
+                if self.reasoning_manager is not None:
+                    try:
+                        decision_id = decision.get("id", event.correlation_id)
+                        reasoning_mode = decision.get("reasoning_mode", "default")
+                        plan_id = decision.get("plan", {}).get("id") if isinstance(decision.get("plan"), dict) else None
+                        
+                        # Create read-only execution context for reasoning
+                        reasoning_context: Dict[str, Any] = {
+                            "decision_id": decision_id,
+                            "timestamp": int(time.time() * 1000),
+                            "event_type": event.event_type,
+                            "correlation_id": event.correlation_id
+                        }
+                        
+                        # Call reasoning manager - never throws, always returns signals
+                        advisory_signals = await self.reasoning_manager.reason(
+                            decision_id=decision_id,
+                            event_payload=decision,
+                            execution_context=reasoning_context,
+                            reasoning_mode=reasoning_mode,
+                            plan_id=plan_id
+                        )
+                    except Exception as e:
+                        # Never fail orchestration on reasoning errors
+                        advisory_errors.append(f"reasoning_exception: {str(e)}")
+                        if self.logger:
+                            try:
+                                logger.warning("Reasoning manager exception (non-fatal): %s", e)
+                            except Exception:
+                                pass
+
+                # 3. Plan Execution: If decision contains plan, execute it
+                plan_result = None
+                if "plan" in decision and "execution_context" in decision:
+                    try:
+                        plan_result = await self.execute_plan_if_enabled(
+                            decision["plan"], decision["execution_context"]
+                        )
+                        # Post-validation: Check execution constraints
+                        if isinstance(plan_result, dict) and plan_result.get("status") == "failure":
+                            return EventResult(
+                                status="rejected",
+                                reason="plan_execution_failed",
+                                metadata={
+                                    "plan_result": plan_result,
+                                    "advisory_signals": [
+                                        {
+                                            "decision_id": s.decision_id,
+                                            "signal_type": s.signal_type,
+                                            "payload": s.payload,
+                                            "confidence": s.confidence
+                                        }
+                                        for s in advisory_signals
+                                    ],
+                                    "advisory_errors": advisory_errors
+                                }
+                            )
+                    except Exception as e:
+                        advisory_errors.append(f"plan_execution_error: {str(e)}")
+
+                # 4. Process the decision through normal flow
+                try:
+                    await self.process_decision(decision)
+                    decision_id = decision.get("id") or event.correlation_id
+                    return EventResult(
+                        status="accepted",
+                        decision_id=decision_id,
+                        metadata={
+                            "plan_result": plan_result,
+                            "advisory_signals": [
+                                {
+                                    "decision_id": s.decision_id,
+                                    "signal_type": s.signal_type,
+                                    "payload": s.payload,
+                                    "confidence": s.confidence,
+                                    "reasoning_mode": s.reasoning_mode,
+                                    "error": s.error
+                                }
+                                for s in advisory_signals
+                            ],
+                            "advisory_errors": advisory_errors
+                        }
+                    )
+                except Exception as e:
+                    return EventResult(
+                        status="error",
+                        reason=f"decision_processing_error: {str(e)}"
+                    )
+
+            elif event.event_type == "plan_execution":
+                # Direct plan execution request
+                if "plan" not in event.payload or "execution_context" not in event.payload:
+                    return EventResult(status="error", reason="missing_plan_or_context")
+
+                try:
+                    plan_result = await self.execute_plan_if_enabled(
+                        event.payload["plan"], event.payload["execution_context"]
+                    )
+                    if isinstance(plan_result, dict) and plan_result.get("status") == "failure":
+                        return EventResult(
+                            status="rejected",
+                            reason="plan_execution_failed",
+                            metadata={"plan_result": plan_result}
+                        )
+                    return EventResult(
+                        status="accepted",
+                        decision_id=event.correlation_id,
+                        metadata={"plan_result": plan_result}
+                    )
+                except Exception as e:
+                    return EventResult(
+                        status="error",
+                        reason=f"plan_execution_error: {str(e)}"
+                    )
+
+            else:
+                # Unknown event type
+                return EventResult(status="rejected", reason="unsupported_event_type")
+
+        except Exception as e:
+            # 5. State Update: Record any errors atomically
+            async with self._lock:
+                try:
+                    if not hasattr(self, '_event_errors'):
+                        self._event_errors = []
+                    self._event_errors.append({
+                        "ts": int(time.time() * 1000),
+                        "event_type": getattr(event, 'event_type', 'unknown'),
+                        "correlation_id": getattr(event, 'correlation_id', 'unknown'),
+                        "error": str(e)
+                    })
+                    # Keep only recent errors
+                    if len(self._event_errors) > 100:
+                        self._event_errors = self._event_errors[-100:]
+                except Exception:
+                    pass  # Never fail on error recording
+
+            return EventResult(status="error", reason=f"unexpected_error: {str(e)}")
+
     async def close(self):
         # stop DLQ retry task
         if self._dlq_task:
-                try:
-                    self._dlq_task.cancel()
-                    await self._dlq_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.exception("error stopping DLQ task")
+            try:
+                self._dlq_task.cancel()
+                await self._dlq_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("error stopping DLQ task")
         # close redis client if present
         if self._redis:
             try:
@@ -507,23 +1301,23 @@ class DecisionOrchestrator:
         entries = []
         # If redis DLQ enabled, pop one entry atomically (using LPOP) and process
         if _cfg.REDIS_DLQ_ENABLED and self._redis is not None:
+            try:
+                from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
+                # use LPOP to get oldest entry
+                _raw_res = await redis_op(self, lambda r, key: r.lpop(key), _cfg.REDIS_DLQ_KEY)
+                raw = _raw_res.get("value") if isinstance(_raw_res, dict) else _raw_res
+                if raw is None:
+                    return
                 try:
-                    from utils.redis_wrapper import RedisUnavailable, RedisOpFailed
-                    # use LPOP to get oldest entry
-                    _raw_res = await redis_op(self, lambda r, key: r.lpop(key), _cfg.REDIS_DLQ_KEY)
-                    raw = _raw_res.get("value") if isinstance(_raw_res, dict) else _raw_res
-                    if raw is None:
-                        return
-                    try:
-                        entry = json.loads(raw)
-                    except Exception:
-                        logger.exception("invalid DLQ entry in redis, skipping")
-                        return
-                    entries = [entry]
-                except (RedisUnavailable, RedisOpFailed):
-                    logger.exception("error reading from redis DLQ, falling back to in-memory for this iteration")
-                    async with self._dlq_lock:
-                        entries = list(self._persist_dlq)
+                    entry = json.loads(raw)
+                except Exception:
+                    logger.exception("invalid DLQ entry in redis, skipping")
+                    return
+                entries = [entry]
+            except (RedisUnavailable, RedisOpFailed):
+                logger.exception("error reading from redis DLQ, falling back to in-memory for this iteration")
+                async with self._dlq_lock:
+                    entries = list(self._persist_dlq)
         else:
             # copy indices to avoid mutation during iteration
             async with self._dlq_lock:
@@ -597,6 +1391,6 @@ class DecisionOrchestrator:
                         logger.warning("DLQ retry failed for symbol=%s attempts=%d next_attempt_in=%.1fs error=%s", decision.get("symbol"), attempts, delay, str(e))
             except Exception:
                 logger.exception("unexpected error processing DLQ entry")
-                
-                
-                
+
+
+

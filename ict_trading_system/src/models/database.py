@@ -33,13 +33,25 @@ class Trade(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True, index=True)
     signal_id = Column(Integer, ForeignKey('signals.id'))
+    
+    # Core trade fields (existing)
     entry_price = Column(Float)
     sl = Column(Float)
     tp = Column(Float)
-    outcome = Column(String)
-    pnl = Column(Float)
-    notes = Column(Text)
+    outcome = Column(String, nullable=True)  # "win", "loss", "breakeven" (nullable for backward compat)
+    pnl = Column(Float, nullable=True)
+    notes = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=func.now())
+    
+    # Outcome-aware fields (new, optional)
+    # These fields enable symmetry with reasoner_service.DecisionOutcome
+    # and track when and how trades close.
+    # FUTURE INTEGRATION: Link to ReasoningManager feedback, PolicyStore refinement
+    decision_id = Column(String, nullable=True, index=True)  # UUID from reasoner_service.Decision
+    exit_price = Column(Float, nullable=True)  # Price at actual exit (may differ from TP/SL)
+    exit_reason = Column(String, nullable=True)  # "tp", "sl", "manual", "timeout"
+    closed_at = Column(DateTime, nullable=True, index=True)  # When trade actually closed
+    
     signal = relationship("Signal", back_populates="trades")
 
 class Setting(Base):

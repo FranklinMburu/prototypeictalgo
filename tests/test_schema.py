@@ -3,7 +3,7 @@
 
 # No Decision, Triggers, Versions in current codebase. Import Signal, Analysis, Trade, Setting from the real schemas module.
 import pytest
-from src.models.schemas import Signal, Analysis, Trade, Setting
+from ict_trading_system.src.models.schemas import Signal, Analysis, Trade, Setting
 from pydantic import ValidationError
 
 
