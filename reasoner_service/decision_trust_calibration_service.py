@@ -84,11 +84,24 @@ class DecisionTrustCalibrationService:
 
     def calibrate_signals(self, memory_snapshot):
         """
-        Compute consistency metrics between signals and actual outcomes.
+        Compute historical consistency metrics between signals and actual outcomes.
 
-        This method is DESCRIPTIVE ONLY. It analyzes historical alignment
-        between signal predictions and outcomes that actually occurred.
-        It does NOT recommend trusting or distrusting any signal.
+        ⚠️  AUTHORITY WARNING:
+        This method is INFORMATIONAL ONLY and produces DESCRIPTIVE HISTORICAL ANALYSIS.
+        
+        It analyzes historical alignment between signal predictions and outcomes that
+        actually occurred. This is a READ-ONLY analysis of past data.
+        
+        🚫 CRITICAL — THIS ANALYSIS:
+        - Does NOT recommend trusting or distrusting any signal
+        - Has ZERO authority over signal weighting or selection
+        - Must NEVER be wired to decision-making logic
+        - Must NEVER be used for real-time signal filtering
+        - Is NOT predictive of future signal performance
+        - Cannot and must not influence trading decisions
+        
+        Any downstream use of this analysis to make trading decisions
+        violates the fundamental design constraint of this service.
 
         Parameters:
         -----------
@@ -101,19 +114,20 @@ class DecisionTrustCalibrationService:
         Returns:
         --------
         dict with keys:
-            - "disclaimer": Informational-only statement
-            - "total_signals": Count of signals analyzed
-            - "total_outcomes": Count of outcomes analyzed
-            - "signals_by_type": Breakdown by signal type
-            - "consistency_analysis": Historical alignment metrics
-            - "explanation": Why these are informational only
+            - "disclaimer": Mandatory non-authority statement
+            - "total_signals": Count of signals analyzed (descriptive)
+            - "total_outcomes": Count of outcomes analyzed (descriptive)
+            - "signals_by_type": Breakdown by signal type (descriptive)
+            - "consistency_analysis": Historical alignment metrics (descriptive, not predictive)
+            - "explanation": Why these metrics are historical only
             - "processed_at": Timestamp of analysis
 
-        IMPORTANT:
-        - This is NOT a recommendation engine
-        - Consistency does NOT imply future reliability
-        - These metrics are historical only
-        - Should never influence decision-making
+        INFORMATIONAL-ONLY CONSTRAINTS:
+        - Consistency rate is DESCRIPTIVE of past alignment, NOT predictive
+        - High consistency does NOT mean the signal is reliable
+        - Low consistency does NOT mean the signal should be distrusted
+        - These metrics are suitable only for historical analysis and audit trails
+        - Should NEVER influence decision-making algorithms
         """
         try:
             # Deepcopy input to prevent external modification
@@ -179,11 +193,25 @@ class DecisionTrustCalibrationService:
 
     def calibrate_policies(self, offline_evaluations):
         """
-        Compute regret frequency and violation patterns for policies.
+        Compute historical violation frequency and regret patterns for policies.
 
-        This method is DESCRIPTIVE ONLY. It analyzes how often policies
-        were violated and computes historical regret metrics. It does NOT
-        recommend policy changes, weighting, or optimization.
+        ⚠️  AUTHORITY WARNING:
+        This method is INFORMATIONAL ONLY and produces DESCRIPTIVE HISTORICAL ANALYSIS.
+        
+        It analyzes how often policies were violated and computes historical regret
+        metrics by replaying past decisions. This is a READ-ONLY historical analysis.
+        
+        🚫 CRITICAL — THIS ANALYSIS:
+        - Does NOT recommend policy changes or optimization
+        - Has ZERO authority over policy weighting or selection
+        - Does NOT compute which policies are "better" or "worse"
+        - Must NEVER be wired to policy enforcement or adaptation
+        - Must NEVER influence policy parameters or weights
+        - Is NOT for real-time policy evaluation
+        - Cannot and must not influence trading decisions
+        
+        Any downstream use of this analysis to modify policies, weights,
+        or enforcement rules violates the fundamental design constraint.
 
         Parameters:
         -----------
@@ -191,24 +219,25 @@ class DecisionTrustCalibrationService:
             Evaluations from DecisionOfflineEvaluationService containing:
             - policy_results: List of policy evaluation records
             - violation_events: Records of policy violations
-            - counterfactual_outcomes: What would have happened
+            - counterfactual_outcomes: What would have happened (hypothetical)
 
         Returns:
         --------
         dict with keys:
-            - "disclaimer": Informational-only statement
-            - "total_policies": Count of unique policies
-            - "total_evaluations": Count of evaluation records
-            - "violation_summary": Historical violation patterns
-            - "regret_analysis": Patterns in counterfactual outcomes
+            - "disclaimer": Mandatory non-authority statement
+            - "total_policies": Count of unique policies analyzed (descriptive)
+            - "total_evaluations": Count of evaluation records (descriptive)
+            - "violation_summary": Historical violation patterns (descriptive)
+            - "regret_analysis": Patterns in counterfactual outcomes (historical, not predictive)
             - "explanation": Why these are descriptive only
             - "processed_at": Timestamp of analysis
 
-        IMPORTANT:
-        - Violation frequency is NOT a policy ranking
-        - Regret analysis is NOT an optimization guide
-        - This cannot be used to modify policy weights
-        - These are historical patterns only
+        INFORMATIONAL-ONLY CONSTRAINTS:
+        - Violation frequency is HISTORICAL, not predictive of future violations
+        - Regret analysis is OBSERVATIONAL of past counterfactuals, not prescriptive
+        - High violation frequency does NOT indicate a policy should be modified
+        - Cannot be used to modify policy weights, thresholds, or enforcement
+        - Regret is a hypothetical metric, not a performance score
         """
         try:
             # Deepcopy input
@@ -279,41 +308,57 @@ class DecisionTrustCalibrationService:
 
     def calibrate_reviewers(self, human_reviews, counterfactual_results):
         """
-        Measure alignment between human reviews and counterfactual outcomes.
+        Measure historical alignment between human reviews and counterfactual outcomes.
 
-        This method is DESCRIPTIVE ONLY. It measures how often human reviewers
-        agreed or disagreed with what counterfactual analysis suggested would
-        have been better outcomes. It does NOT rank, score, or weight reviewers.
+        ⚠️  AUTHORITY WARNING:
+        This method is INFORMATIONAL ONLY and produces DESCRIPTIVE HISTORICAL ANALYSIS.
+        
+        It measures how often human reviewers' concerns aligned with what counterfactual
+        analysis suggested hypothetically. This is a READ-ONLY historical comparison.
+        
+        🚫 CRITICAL — THIS ANALYSIS:
+        - Does NOT rank, score, or weight reviewers
+        - Has ZERO authority over reviewer authority or influence
+        - Does NOT compute which reviewers are "more reliable"
+        - Must NEVER be wired to reviewer filtering or weighting
+        - Must NEVER influence downstream handling of human reviews
+        - Cannot and must not influence trading decisions
+        
+        Disagreement frequency is descriptive only. Reviewers with higher
+        disagreement counts are not "worse" — they may simply be more critical.
+        Any downstream use of this analysis to rank or weight reviewers
+        violates the fundamental design constraint.
 
         Parameters:
         -----------
         human_reviews : dict or list
             Reviews from DecisionHumanReviewService containing:
             - review_sessions: List of review session records
-            - annotations: Human observations and annotations
+            - annotations: Human observations and annotations (informational)
             - disagreements: Records of human disagreements
 
         counterfactual_results : dict or list
             Results from CounterfactualEnforcementSimulator containing:
-            - counterfactual_outcomes: What would have happened
-            - simulated_results: Alternative decision outcomes
+            - counterfactual_outcomes: What would have happened (hypothetical)
+            - simulated_results: Alternative decision outcomes (hypothetical)
 
         Returns:
         --------
         dict with keys:
-            - "disclaimer": Informational-only statement
-            - "total_reviewers": Count of unique reviewers
-            - "total_reviews": Count of review records
-            - "alignment_analysis": Alignment with counterfactual outcomes
-            - "disagreement_patterns": Historical disagreement persistence
+            - "disclaimer": Mandatory non-authority statement
+            - "total_reviewers": Count of unique reviewers (descriptive)
+            - "total_reviews": Count of review records (descriptive)
+            - "alignment_analysis": Alignment with counterfactual outcomes (descriptive, historical)
+            - "disagreement_patterns": Historical disagreement persistence (descriptive, not ranking)
             - "explanation": Why these are descriptive only
             - "processed_at": Timestamp of analysis
 
-        IMPORTANT:
-        - Alignment frequency is NOT a reviewer ranking
-        - Disagreement patterns are NOT performance scores
-        - This cannot be used to weight human input
-        - No reviewer is "better" or "worse" based on these metrics
+        INFORMATIONAL-ONLY CONSTRAINTS:
+        - Alignment frequency is HISTORICAL, not predictive of reviewer value
+        - Disagreement patterns are DESCRIPTIVE, not performance scores
+        - High disagreement does NOT indicate a reviewer should be de-weighted
+        - Cannot be used to modify reviewer authority, weighting, or influence
+        - All metrics are context-dependent and non-rankable across reviewers
         """
         try:
             # Deepcopy inputs
@@ -386,11 +431,28 @@ class DecisionTrustCalibrationService:
 
     def compute_stability(self, memory_snapshot):
         """
-        Compute confidence stability and decay over time.
+        Compute historical confidence stability and variance over time.
 
-        This method is DESCRIPTIVE ONLY. It analyzes how stable confidence
-        levels have been over time, whether confidence decays, and variance
-        patterns. It does NOT use this to modify future confidence or weights.
+        ⚠️  AUTHORITY WARNING:
+        This method is INFORMATIONAL ONLY and produces DESCRIPTIVE HISTORICAL ANALYSIS.
+        
+        It analyzes how stable historical confidence levels have been, whether
+        confidence shows decay patterns, and variance characteristics. This is
+        a READ-ONLY historical analysis of past confidence data.
+        
+        🚫 CRITICAL — THIS ANALYSIS:
+        - Does NOT predict future confidence levels
+        - Has ZERO authority over confidence thresholds or parameters
+        - Does NOT indicate whether confidence "should be" adjusted
+        - Must NEVER be wired to real-time confidence modification
+        - Must NEVER influence decision filtering based on stability
+        - Is purely observational of historical patterns
+        - Cannot and must not influence trading decisions
+        
+        Stability decay is a historical observation, not a signal to
+        suppress or filter future decisions. Any downstream use of this
+        analysis to modify confidence handling or decision acceptance
+        violates the fundamental design constraint.
 
         Parameters:
         -----------
@@ -402,20 +464,22 @@ class DecisionTrustCalibrationService:
         Returns:
         --------
         dict with keys:
-            - "disclaimer": Informational-only statement
-            - "total_records": Count of confidence records analyzed
-            - "confidence_statistics": Mean, median, std dev (descriptive)
-            - "decay_analysis": Confidence decay over time (if any)
-            - "variance_analysis": Dispersion of confidence values
-            - "stability_index": Aggregated stability metric
+            - "disclaimer": Mandatory non-authority statement
+            - "total_records": Count of confidence records analyzed (descriptive)
+            - "confidence_statistics": Mean, median, std dev (descriptive, historical)
+            - "decay_analysis": Confidence decay over time (if observed, descriptive only)
+            - "variance_analysis": Dispersion of confidence values (descriptive)
+            - "stability_index": Aggregated stability metric (descriptive, not prescriptive)
             - "explanation": Why these are descriptive only
             - "processed_at": Timestamp of analysis
 
-        IMPORTANT:
-        - Stability metrics are HISTORICAL only
-        - Decay patterns are OBSERVATIONAL
-        - These do NOT predict future confidence
-        - Should never be used to modify confidence levels
+        INFORMATIONAL-ONLY CONSTRAINTS:
+        - Stability metrics are HISTORICAL only, not predictive
+        - Decay patterns are OBSERVATIONAL from past data
+        - These do NOT predict or influence future confidence
+        - Cannot be used to modify confidence levels or thresholds
+        - High decay does NOT indicate future decisions should be suppressed
+        - Low stability does NOT indicate future decisions will be bad
         """
         try:
             # Deepcopy input
@@ -483,29 +547,37 @@ class DecisionTrustCalibrationService:
 
     def export_trust_snapshot(self, calibration_result, format="json"):
         """
-        Export trust calibration results with explicit disclaimers.
+        Export trust calibration results with mandatory non-authority disclaimers.
+
+        ⚠️  CRITICAL STATEMENT:
+        All exported data is INFORMATIONAL ONLY. Every export includes a prominent
+        disclaimer that this data has ZERO authority over trading decisions.
 
         This method produces deterministic exports (sorted keys, consistent ordering)
-        of trust calibration analysis. All exports include prominent disclaimers that
-        these results have no authority over trading decisions.
+        of historical trust calibration analysis. Exports are READ-ONLY and must
+        never be modified or wired to execution logic.
 
         Parameters:
         -----------
         calibration_result : dict
             Result from any calibration or stability computation method
+            (must already include disclaimers)
 
         format : str
             Export format: "json" or "text"
+            Both formats include non-authority disclaimers
 
         Returns:
         --------
         str
-            Exported result in specified format
+            Exported result in specified format with mandatory disclaimer
 
-        IMPORTANT:
-        - All exports are deterministic (same input = same output)
-        - All exports include comprehensive disclaimers
-        - Sorted keys ensure reproducibility
+        INFORMATIONAL-ONLY CONSTRAINTS:
+        - All exports are deterministic (same input = same output always)
+        - All exports include comprehensive non-authority disclaimers
+        - Sorted keys ensure reproducibility and auditability
+        - Exports are suitable only for historical analysis and archival
+        - Must NEVER be wired to decision-making, execution, or policy application
         """
         try:
             # Deepcopy input to prevent modification
@@ -532,15 +604,44 @@ class DecisionTrustCalibrationService:
     # ========== PRIVATE HELPER METHODS ==========
 
     def _get_disclaimer(self):
-        """Get standard informational disclaimer."""
+        """Get mandatory non-authority disclaimer.
+        
+        This disclaimer must appear in EVERY output. It is the primary
+        control preventing misuse of this informational service.
+        
+        🚫 ABSOLUTE CONSTRAINT:
+        Any output lacking this disclaimer is considered a bug.
+        """
         return (
-            "Informational analysis only. This output has no authority over trading decisions. "
-            "Trust calibration metrics are DESCRIPTIVE HISTORICAL ANALYSIS. "
-            "These results cannot be used to make trading decisions."
+            "🚫 AUTHORITY WARNING - THIS OUTPUT HAS ZERO DECISION AUTHORITY:\n"
+            "This is INFORMATIONAL ANALYSIS ONLY. These trust calibration metrics are "
+            "DESCRIPTIVE HISTORICAL ANALYSIS of past performance patterns.\n"
+            "\n"
+            "⚠️  CRITICAL CONSTRAINTS:\n"
+            "- This analysis has NO authority over trading decisions, execution, or operations\n"
+            "- These results must NEVER be wired to decision-making logic\n"
+            "- Do not rank or apply this data to systems\n"
+            "- Do not optimize filtering or suppression based on this data\n"
+            "- Historical patterns do NOT indicate future behavior\n"
+            "- All metrics are context-dependent and non-comparable\n"
+            "\n"
+            "Any use of this analysis to influence trading or make trading decisions "
+            "is a fundamental violation of system design. "
+            "Execution authority must reside in a separate system boundary."
         )
 
     def _compute_signal_consistency(self, signal_records, outcome_records):
-        """Compute consistency between signals and outcomes."""
+        """Compute historical consistency between signals and outcomes.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes how often signals historically aligned with outcomes.
+        This is a HISTORICAL METRIC with zero predictive or prescriptive power.
+        
+        High consistency does NOT mean signals should be trusted or weighted higher.
+        Low consistency does NOT mean signals should be distrusted or filtered.
+        
+        This metric is suitable only for audit and historical analysis.
+        """
         if not signal_records or not outcome_records:
             return self._empty_consistency_analysis()
 
@@ -586,7 +687,18 @@ class DecisionTrustCalibrationService:
         return policies
 
     def _compute_violation_patterns(self, policy_results, violation_events):
-        """Compute historical violation patterns."""
+        """Compute historical violation patterns.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes how often policies were violated in the past.
+        This is a HISTORICAL FREQUENCY metric with zero prescriptive power.
+        
+        High violation frequency does NOT indicate a policy should be modified.
+        Low violation frequency does NOT indicate a policy is working well.
+        
+        These patterns are suitable only for historical analysis and compliance review.
+        Do NOT use to drive policy adaptation or enforcement changes.
+        """
         violation_counts = defaultdict(int)
         total_evaluations = len(policy_results)
 
@@ -649,7 +761,19 @@ class DecisionTrustCalibrationService:
         return reviewers
 
     def _compute_alignment_patterns(self, review_records, counterfactual_records):
-        """Compute alignment between reviewers and counterfactuals."""
+        """Compute historical alignment between reviewers and counterfactuals.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes how often human reviewer concerns aligned with counterfactual
+        analysis. This is a HISTORICAL COMPARISON metric with zero rankability.
+        
+        High alignment does NOT indicate a reviewer is more reliable or should be weighted higher.
+        Low alignment does NOT indicate a reviewer is less reliable or should be filtered.
+        
+        Alignment rates are CONTEXT-DEPENDENT and NON-COMPARABLE across reviewers.
+        This metric is suitable only for historical analysis.
+        Do NOT use to rank, weight, or filter reviewers.
+        """
         alignment_matches = 0
         total_comparisons = 0
 
@@ -678,7 +802,20 @@ class DecisionTrustCalibrationService:
         }
 
     def _compute_disagreement_persistence(self, review_records):
-        """Compute disagreement persistence patterns."""
+        """Compute historical disagreement persistence patterns.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes how often reviewers historically disagreed.
+        This is a FREQUENCY metric with zero performance implications.
+        
+        High disagreement frequency does NOT indicate a reviewer is unreliable or should be filtered.
+        Low disagreement frequency does NOT indicate a reviewer is reliable or should be weighted higher.
+        
+        Disagreement patterns are CONTEXT-DEPENDENT and NON-COMPARABLE across reviewers.
+        Critical reviewers may naturally have higher disagreement counts.
+        This metric is suitable only for historical analysis.
+        Do NOT use to rank or weight reviewers.
+        """
         disagreement_counts = defaultdict(int)
         total_reviews = len(review_records)
 
@@ -699,7 +836,18 @@ class DecisionTrustCalibrationService:
         }
 
     def _compute_confidence_statistics(self, confidence_records):
-        """Compute confidence statistics."""
+        """Compute historical confidence statistics.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes descriptive statistics on past confidence values.
+        These are HISTORICAL OBSERVATIONS with zero predictive power.
+        
+        Mean/median confidence does NOT predict future confidence levels.
+        Confidence variance does NOT indicate future decisions should be filtered.
+        
+        These statistics are suitable only for historical analysis and audit trails.
+        Do NOT use to predict, suppress, or adjust future confidence values.
+        """
         if not confidence_records:
             return self._empty_confidence_statistics()
 
@@ -731,7 +879,19 @@ class DecisionTrustCalibrationService:
             return self._empty_confidence_statistics()
 
     def _compute_decay_pattern(self, confidence_records):
-        """Compute confidence decay over time."""
+        """Compute historical confidence decay over time.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes observed confidence decay from past data.
+        This is a HISTORICAL PATTERN with zero predictive or prescriptive power.
+        
+        Observed decay in past confidence does NOT predict future decay.
+        Observed decay does NOT indicate future decisions should be suppressed or filtered.
+        
+        Decay patterns are CONTEXT-DEPENDENT and transient.
+        This metric is suitable only for historical analysis and audit trails.
+        Do NOT use to adjust, suppress, or modify future confidence levels.
+        """
         if not confidence_records or len(confidence_records) < 2:
             return self._empty_decay_analysis()
 
@@ -758,7 +918,19 @@ class DecisionTrustCalibrationService:
             return self._empty_decay_analysis()
 
     def _compute_variance_analysis(self, confidence_records):
-        """Compute variance analysis."""
+        """Compute historical variance analysis.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This computes variance and dispersion of past confidence values.
+        This is a HISTORICAL OBSERVATION with zero predictive power.
+        
+        High variance does NOT indicate future confidence will be unstable.
+        Low variance does NOT indicate future confidence will be stable.
+        
+        Variance patterns are TRANSIENT and CONTEXT-DEPENDENT.
+        This metric is suitable only for historical analysis and audit trails.
+        Do NOT use to suppress, filter, or adjust future decisions based on variance.
+        """
         if not confidence_records:
             return self._empty_variance_analysis()
 
@@ -787,7 +959,22 @@ class DecisionTrustCalibrationService:
             return self._empty_variance_analysis()
 
     def _compute_stability_index(self, stats, decay, variance):
-        """Compute aggregate stability index."""
+        """Compute aggregate stability index.
+        
+        ⚠️  INFORMATIONAL ONLY:
+        This aggregates historical variance and decay into a single index (0.0-1.0).
+        This is a DERIVED HISTORICAL METRIC with zero prescriptive power.
+        
+        Stability index is NOT:
+        - A performance score
+        - A reliability measure
+        - A future predictor
+        - Authority to suppress or filter decisions
+        
+        Index values are CONTEXT-DEPENDENT and NON-COMPARABLE.
+        This metric is suitable only for historical analysis and audit trails.
+        Do NOT use this index to weight, filter, or adjust future decisions.
+        """
         try:
             # Stability = 1.0 when perfectly stable (low variance, no decay)
             # Stability = 0.0 when chaotic (high variance, high decay)
