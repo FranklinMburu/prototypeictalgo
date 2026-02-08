@@ -13,3 +13,33 @@ nohup.out
 *.log
 *.out
 *.bak
+*.md
+
+# Environment files (Security: API keys, credentials)
+ict_trading_system/.env
+ict_trading_system/backend/.env
+
+# Database files (Build artifacts)
+*.db
+trading_system.db
+ict_trading_system/backend/alerts.db
+
+# Python cache (Build artifacts)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Application logs
+ict_trading_system/src/logs/
+logs/
+
+# IDE & editor configs (optional - exclude user-specific)
+.vscode/
+.idea/
+
+# Demo & test payloads (generated/development only)
+test_payload.json
+sample_alert.json
+test_signal*.json
+demo.py
+demo_reasoning_integration.py
