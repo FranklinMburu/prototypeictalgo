@@ -9,7 +9,8 @@ def send_telegram_message(message: str) -> bool:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
-        print("Telegram bot token or chat ID not set in environment.")
+        logger = logging.getLogger(__name__)
+        logger.error("Telegram bot token or chat ID not set in environment.")
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
@@ -18,10 +19,12 @@ def send_telegram_message(message: str) -> bool:
         if resp.status_code == 200:
             return True
         else:
-            print(f"Telegram error: {resp.status_code} {resp.text}")
+            logger = logging.getLogger(__name__)
+            logger.error(f"Telegram error: {resp.status_code} {resp.text}")
             return False
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        logger = logging.getLogger(__name__)
+        logger.error(f"Telegram send error: {e}")
         return False
 
 import logging
@@ -46,9 +49,6 @@ async def send_telegram_alert(message: str, max_retries: int = 3, retry_delay: f
             "parse_mode": "Markdown",
             "disable_web_page_preview": True
         }
-        logger.info(f"[TELEGRAM DEBUG] Bot token: {settings.TELEGRAM_BOT_TOKEN}")
-        logger.info(f"[TELEGRAM DEBUG] Chat ID: {chat_id} (type: {type(chat_id)})")
-        logger.info(f"[TELEGRAM DEBUG] Message: {message}")
         sent = False
         for attempt in range(1, max_retries + 1):
             try:

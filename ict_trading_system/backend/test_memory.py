@@ -1,5 +1,8 @@
 import asyncio
+import logging
 from memory_service import init_redis, on_new_alert, inspect_snapshot
+
+logger = logging.getLogger(__name__)
 
 async def main():
     redis = await init_redis()
@@ -19,10 +22,10 @@ async def main():
         }
     }
     snap = await on_new_alert(redis, alert)
-    print("Fused snapshot:", snap)
+    logger.info(f"Fused snapshot: {snap}")
     # Inspect snapshot
     snap2 = await inspect_snapshot(redis, "BTCUSD")
-    print("Inspect snapshot:", snap2)
+    logger.info(f"Inspect snapshot: {snap2}")
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+import logging
 
+logger = logging.getLogger(__name__)
 
 # --- Telegram notification logic (inlined for import safety) ---
 import requests
@@ -14,7 +16,7 @@ def send_telegram_message(message: str) -> bool:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_ids = ["7389181251", "7713702036"]  # Add/remove chat IDs as needed
     if not bot_token or not chat_ids:
-        print("Telegram bot token or chat IDs not set in environment.")
+        logger.error("Telegram bot token or chat IDs not set in environment.")
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     success = True
@@ -23,10 +25,10 @@ def send_telegram_message(message: str) -> bool:
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code != 200:
-                print(f"Telegram error for {chat_id}: {resp.status_code} {resp.text}")
+                logger.error(f"Telegram error for {chat_id}: {resp.status_code} {resp.text}")
                 success = False
         except Exception as e:
-            print(f"Telegram send error for {chat_id}: {e}")
+            logger.error(f"Telegram send error for {chat_id}: {e}")
             success = False
     return success
 
@@ -36,7 +38,7 @@ app = FastAPI()
 async def tradingview_webhook(request: Request):
     try:
         data = await request.json()
-        print("Received TradingView alert:", data)
+        logger.debug("Received TradingView alert", extra={"data": data})
         # AI/Reasoning Agent analysis
         ai_result = analyze_trade_signal(data)
 
@@ -78,7 +80,7 @@ async def tradingview_webhook(request: Request):
         tg_ok = send_telegram_message(msg)
         return JSONResponse(content={"status": "ok", "received": data, "telegram_sent": tg_ok, "db_id": alert.id, "ai": ai_result})
     except Exception as e:
-        print("Error processing webhook:", e)
+        logger.error(f"Error processing webhook: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail="Invalid payload")
 
 if __name__ == "__main__":
