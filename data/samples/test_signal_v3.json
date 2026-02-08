@@ -1,0 +1,24 @@
+{
+  "symbol": "BNBUSD",
+  "timeframe": "15M",
+  "signal_type": "CHoCH",
+  "confidence": 82,
+  "timestamp": "2026-02-06T09:15:00Z",
+  "price_data": {
+    "open": 625,
+    "high": 640,
+    "low": 615,
+    "close": 635
+  },
+  "sl": 615,
+  "tp": 680,
+  "multi_tf": {
+    "1H": "bullish",
+    "4H": "bullish"
+  },
+  "confluences": [
+    "fibonacci_level",
+    "supply_zone",
+    "moving_average_20"
+  ]
+}

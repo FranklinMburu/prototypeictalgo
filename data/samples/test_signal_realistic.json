@@ -1,0 +1,27 @@
+{
+  "symbol": "EURUSD",
+  "timeframe": "4H",
+  "signal_type": "BOS",
+  "confidence": 92,
+  "timestamp": "2026-02-06T14:00:00Z",
+  "price_data": {
+    "open": 1.0845,
+    "high": 1.0875,
+    "low": 1.0820,
+    "close": 1.0868
+  },
+  "sl": 1.0805,
+  "tp": 1.0950,
+  "multi_tf": {
+    "1H": "bullish",
+    "4H": "bullish",
+    "daily": "bullish"
+  },
+  "confluences": [
+    "break_of_structure",
+    "support_level_break",
+    "moving_average_200_cross",
+    "fibonacci_618_retest",
+    "volume_surge"
+  ]
+}

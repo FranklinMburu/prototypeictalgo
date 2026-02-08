@@ -33,5 +33,6 @@ class Settings(BaseSettings):
 import logging
 
 settings = Settings()
-print(f"[DEBUG] Loaded WEBHOOK_SECRET: {settings.WEBHOOK_SECRET}")
-logging.getLogger().info(f"[DEBUG] Loaded WEBHOOK_SECRET: {settings.WEBHOOK_SECRET}")
+logger = logging.getLogger(__name__)
+logger.debug("[CONFIG] Settings loaded from environment")
+

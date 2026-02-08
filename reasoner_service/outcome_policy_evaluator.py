@@ -526,7 +526,7 @@ class OutcomePolicyEvaluator:
             symbol="EURUSD",
         )
         if result.decision == PolicyDecision.VETO:
-            print(f"Signal vetoed: {result.reason}")
+            logger.info(f"Signal vetoed: {result.reason}")
     """
     
     def __init__(self, stats_service: OutcomeStatsService):

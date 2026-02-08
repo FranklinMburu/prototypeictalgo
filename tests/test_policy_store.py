@@ -306,8 +306,26 @@ class TestPolicyGateIntegration:
         assert "ts" in audit_entry
 
     @pytest.mark.asyncio
-    async def test_permissive_mode_bypasses_all_checks(self):
+    async def test_permissive_mode_bypasses_all_checks(self, monkeypatch):
         """When ENABLE_PERMISSIVE_POLICY=True, all checks should pass."""
+        # Mock get_settings to return permissive config
+        mock_cfg = type('obj', (object,), {
+            'ENABLE_PERMISSIVE_POLICY': True,
+            'DEDUP_WINDOW_SECONDS': 60,
+            'QUIET_HOURS': None,
+            'DEDUP_ENABLED': False,
+            'REDIS_DEDUP_ENABLED': False,
+            'REDIS_DLQ_ENABLED': False,
+            'DLQ_POLL_INTERVAL_SECONDS': 5,
+            'SLACK_WEBHOOK_URL': '',
+            'DISCORD_WEBHOOK_URL': '',
+            'TELEGRAM_TOKEN': '',
+            'TELEGRAM_CHAT_ID': '',
+        })()
+        
+        from reasoner_service import orchestrator as orch_module
+        monkeypatch.setattr(orch_module, "get_settings", lambda: mock_cfg)
+        
         orch = DecisionOrchestrator(":memory:")
 
         # All conditions would normally fail
