@@ -6,4 +6,4 @@ fuser -k 8000/tcp || true
 
 <!-- sending a test payload to webhook receive -->
 
-curl -X POST "http://localhost:8000/api/webhook/receive" -H "Content-Type: application/json" -H "X-WEBHOOK-SECRET: supersecret" --data-binary @test_payload.json
+curl -X POST "http://localhost:8000/api/webhook/receive" -H "Content-Type: application/json" -H "X-WEBHOOK-SECRET: ${WEBHOOK_SECRET}" --data-binary @test_payload.json

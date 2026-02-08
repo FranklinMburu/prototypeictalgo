@@ -258,11 +258,11 @@ Handling: ✅ Non-blocking
 ### Phase 9: Telegram Alert Delivery ✅
 ```
 Service: Telegram Bot Notification
-Bot Token: 7641355105:AAHkGJx9mmrhb0zsEYNw3vvFtooRIVeOdnM
+Bot Token: [REDACTED - Check .env.example for configuration]
 
 Recipients:
-  1. Franklin: 7389181251
-  2. Mary: 7713702036
+  1. Franklin: [REDACTED]
+  2. Mary: [REDACTED]
 
 Alert Format:
   🟢 <b>HIGH CONFIDENCE SETUP</b>
@@ -272,12 +272,12 @@ Alert Format:
   ⏰ Unknown Killzone Active
 
 Logs:
-  [INFO] Telegram alert sent to 7389181251 (attempt 1). ✅
-  [INFO] Telegram alert sent to 7713702036 (attempt 1). ✅
+  [INFO] Telegram alert sent to recipient (attempt 1). ✅
+  [INFO] Telegram alert sent to recipient (attempt 1). ✅
   
 Timestamps:
-  - Alert to Franklin: 2026-02-06 06:20:29
-  - Alert to Mary: 2026-02-06 06:20:29
+  - Alert to recipient 1: 2026-02-06 06:20:29
+  - Alert to recipient 2: 2026-02-06 06:20:29
   
 Status: ✅ BOTH RECIPIENTS NOTIFIED
 ```

@@ -69,7 +69,7 @@ EOF
 
 RESPONSE=$(curl -s -X POST http://localhost:8000/api/webhook/receive \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: supersecret" \
+  -H "X-Webhook-Secret: ${WEBHOOK_SECRET:-your-secret-here}" \
   -d @"$PROJECT_DIR/test_signal_final.json")
 
 echo "📨 Signal sent: BTCUSD 1H CHoCH"

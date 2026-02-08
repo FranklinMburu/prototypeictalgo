@@ -205,7 +205,7 @@ This ensures **zero failures** even if one provider is temporarily unavailable.
    ```bash
    curl -X POST http://localhost:8000/api/webhook/receive \
      -H "Content-Type: application/json" \
-     -H "X-Webhook-Secret: supersecret" \
+     -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
      -d @test_signal.json
    ```
    Check your Telegram for an alert with **AI confidence > 0%**

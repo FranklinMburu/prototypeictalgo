@@ -32,7 +32,7 @@ echo ""
 echo "[2] Sending realistic EURUSD 4H BOS signal..."
 WEBHOOK_RESPONSE=$(curl -s -X POST http://localhost:8000/api/webhook/receive \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: supersecret" \
+  -H "X-Webhook-Secret: ${WEBHOOK_SECRET:-your-secret-here}" \
   -d @test_signal_realistic.json)
 
 echo "Webhook Response: $WEBHOOK_RESPONSE"
