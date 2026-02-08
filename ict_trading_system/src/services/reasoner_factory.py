@@ -9,8 +9,12 @@ class ReasonerFactory:
     @staticmethod
     def create():
         provider = getattr(settings, 'REASONER_PROVIDER', None) or 'gemini'
+        logger.debug(f"[REASONER FACTORY] Selected provider: {provider}")
+        logger.info(f"[REASONER FACTORY] Creating reasoner with provider: {provider}")
         if provider.lower() == 'openai':
+            logger.info("[REASONER FACTORY] Selected OpenAIAdapter")
             return OpenAIAdapter()
+        logger.info(f"[REASONER FACTORY] Selected GeminiAdapter (provider={provider})")
         return GeminiAdapter()
 
 class OpenAIAdapter:

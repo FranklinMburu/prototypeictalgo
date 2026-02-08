@@ -185,7 +185,8 @@ def run_tests():
     _test_formatting()
     _test_tp_sl_fallback()
     _test_latency_metric()
-    print("All notification UX and SLO tests passed.")
+    logger = __import__('logging').getLogger(__name__)
+    logger.info("All notification UX and SLO tests passed.")
 
 
 if __name__ == "__main__":
