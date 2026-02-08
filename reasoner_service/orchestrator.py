@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 from types import SimpleNamespace
 from datetime import datetime, time as dt_time, timezone
 
@@ -11,6 +11,9 @@ from .config import get_settings
 from .plan_execution_schemas import Plan, ExecutionContext, PlanResult, PlanExecutor
 from .orchestrator_events import Event, EventResult
 from .reasoning_manager import ReasoningManager, AdvisorySignal
+from .reasoning_mode_selector import (
+    ReasoningModeSelector, HTFBiasState, ReasoningMode, ModeSelectionError
+)
 from .orchestration_advanced import (
     OrchestrationStateManager, CooldownConfig, SessionWindow,
     SignalFilter, EventState
@@ -129,6 +132,8 @@ class DecisionOrchestrator:
         self._policy_audit = []
         # reasoning manager for bounded advisory signal generation
         self.reasoning_manager: Optional[ReasoningManager] = None
+        # Stage 4: Reasoning Mode Selector (deterministic mode selection)
+        self.reasoning_mode_selector = ReasoningModeSelector()
         # advanced event-driven orchestration
         self.orchestration_state = OrchestrationStateManager()
         self.signal_filter = SignalFilter(policy_store=self.policy_store)
@@ -375,6 +380,78 @@ class DecisionOrchestrator:
         # Allow other advisory outputs
         self._policy_counters["pass"] += 1
         return {"result": "pass"}
+
+    def _select_reasoning_mode(
+        self,
+        decision: Dict[str, Any],
+        event: Event
+    ) -> Union[ReasoningMode, EventResult]:
+        """Stage 4: Select reasoning mode based on HTF bias and position state.
+        
+        Returns:
+            Selected mode string if successful
+            EventResult(status='rejected') if mode selection fails
+        """
+        # Extract state
+        htf_bias_state_str = decision.get("htf_bias_state")
+        position_open = decision.get("position_open", False)
+        decision_id = decision.get("id", event.correlation_id)
+        
+        # Validate inputs
+        if htf_bias_state_str is None:
+            logger.error(
+                "Stage 4: htf_bias_state missing (decision: %s)",
+                decision_id
+            )
+            return EventResult(
+                status="rejected",
+                reason="mode_selection_failed",
+                metadata={"error": "htf_bias_state_missing"}
+            )
+        
+        try:
+            htf_bias_state = HTFBiasState(htf_bias_state_str)
+        except ValueError:
+            logger.error(
+                "Stage 4: invalid htf_bias_state='%s' (decision: %s)",
+                htf_bias_state_str,
+                decision_id
+            )
+            return EventResult(
+                status="rejected",
+                reason="mode_selection_failed",
+                metadata={"error": f"invalid_htf_bias_state:{htf_bias_state_str}"}
+            )
+        
+        # Select mode
+        try:
+            result = self.reasoning_mode_selector.select_mode(
+                htf_bias_state=htf_bias_state,
+                position_open=position_open
+            )
+            if result.error:
+                logger.error(
+                    "Stage 4: mode selection error: %s (decision: %s)",
+                    result.error,
+                    decision_id
+                )
+                return EventResult(
+                    status="rejected",
+                    reason="mode_selection_failed",
+                    metadata={"error": result.error}
+                )
+            return result.mode
+        except ModeSelectionError as e:
+            logger.error(
+                "Stage 4: %s (decision: %s)",
+                e.message,
+                decision_id
+            )
+            return EventResult(
+                status="rejected",
+                reason="mode_selection_failed",
+                metadata={"error": e.message}
+            )
 
     async def setup(self):
         # Create async engine and sessionmaker pair. Use sessionmaker for persistence calls.
@@ -1034,39 +1111,49 @@ class DecisionOrchestrator:
                         metadata={"policy_result": policy_result}
                     )
 
-                # 2.5. Bounded Reasoning: Generate advisory signals if reasoning manager available
+                # Stage 4: Reasoning Mode Selection
+                # Select mode based on HTF bias and position state.
+                # Returns early if mode selection fails.
                 advisory_signals: List[AdvisorySignal] = []
                 advisory_errors: List[str] = []
+                selected_reasoning_mode: Optional[ReasoningMode] = None
+                
                 if self.reasoning_manager is not None:
+                    # Attempt mode selection
+                    mode_result = self._select_reasoning_mode(decision, event)
+                    if isinstance(mode_result, EventResult):
+                        # Mode selection failed; return rejection
+                        return mode_result
+                    
+                    selected_reasoning_mode = mode_result
+                    logger.info(
+                        "Stage 4 Mode Selected: %s (decision: %s)",
+                        selected_reasoning_mode,
+                        decision.get("id", event.correlation_id)
+                    )
+                    
+                    # Guard: reasoning only with valid mode
                     try:
                         decision_id = decision.get("id", event.correlation_id)
-                        reasoning_mode = decision.get("reasoning_mode", "default")
                         plan_id = decision.get("plan", {}).get("id") if isinstance(decision.get("plan"), dict) else None
                         
-                        # Create read-only execution context for reasoning
-                        reasoning_context: Dict[str, Any] = {
-                            "decision_id": decision_id,
-                            "timestamp": int(time.time() * 1000),
-                            "event_type": event.event_type,
-                            "correlation_id": event.correlation_id
-                        }
-                        
-                        # Call reasoning manager - never throws, always returns signals
+                        # Invoke reasoning manager
                         advisory_signals = await self.reasoning_manager.reason(
                             decision_id=decision_id,
                             event_payload=decision,
-                            execution_context=reasoning_context,
-                            reasoning_mode=reasoning_mode,
+                            execution_context={
+                                "decision_id": decision_id,
+                                "timestamp": int(time.time() * 1000),
+                                "event_type": event.event_type,
+                                "correlation_id": event.correlation_id,
+                                "reasoning_mode": selected_reasoning_mode
+                            },
+                            reasoning_mode=selected_reasoning_mode,
                             plan_id=plan_id
                         )
                     except Exception as e:
-                        # Never fail orchestration on reasoning errors
                         advisory_errors.append(f"reasoning_exception: {str(e)}")
-                        if self.logger:
-                            try:
-                                logger.warning("Reasoning manager exception (non-fatal): %s", e)
-                            except Exception:
-                                pass
+                        logger.warning("Reasoning exception (non-fatal): %s", e)
 
                 # 3. Plan Execution: If decision contains plan, execute it
                 plan_result = None
