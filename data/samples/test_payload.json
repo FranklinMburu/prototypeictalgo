@@ -1,0 +1,12 @@
+{
+  "symbol": "XAGx USD",
+  "timeframe": "15m",
+  "signal_type": "CHoCH",
+  "confidence": 90,
+  "timestamp": 1752136200000,
+  "price_data": {"open": 1920.5, "high": 1925.0, "low": 1918.0, "close": 1922.0},
+  "sl": 1915.0,
+  "tp": 1930.0,
+  "multi_tf": ["1h", "4h"],
+  "confluences": ["liquidity sweep", "order block", "killzone"]
+}

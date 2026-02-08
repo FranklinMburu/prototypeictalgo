@@ -1,0 +1,24 @@
+{
+  "symbol": "ETHUSD",
+  "timeframe": "4H",
+  "signal_type": "BoS",
+  "confidence": 78,
+  "timestamp": "2026-02-06T08:45:00Z",
+  "price_data": {
+    "open": 2450,
+    "high": 2520,
+    "low": 2380,
+    "close": 2500
+  },
+  "sl": 2380,
+  "tp": 2650,
+  "multi_tf": {
+    "1H": "bullish",
+    "daily": "bullish"
+  },
+  "confluences": [
+    "previous_resistance",
+    "moving_average_50",
+    "volume_spike"
+  ]
+}

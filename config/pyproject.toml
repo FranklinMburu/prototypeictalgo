@@ -1,0 +1,5 @@
+[project]
+name = "reasoner_service"
+version = "0.1.0"
+description = "Reasoner service that converts market snapshots into decisions via LLM with validation, repair and deterministic fallback."
+requires-python = ">=3.11"
