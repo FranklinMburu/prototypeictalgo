@@ -1,49 +1,56 @@
+# Python Environment
 venv/
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
-*.sqlite3
-logs/
+.pytest_cache/
+
+# Environment & Secrets (SECURITY)
 .env
-nohup.out
-.DS_Store
-*.log
-*.out
-*.bak
-
-# .md files are IGNORED EXCEPT in /docs folder (documentation)
-*.md
-!docs/**/*.md
-!docs/*.md
-
-# Environment files (Security: API keys, credentials)
+.env.local
 ict_trading_system/.env
 ict_trading_system/backend/.env
 
-# Database files (Build artifacts)
+# Databases (Local only, not committed)
 *.db
+*.sqlite3
 trading_system.db
 ict_trading_system/backend/alerts.db
+data/databases/*.db
 
-# Python cache (Build artifacts)
-**/__pycache__/
-**/*.pyc
-**/*.pyo
-
-# Application logs
-ict_trading_system/src/logs/
+# Logs & Outputs (Runtime)
+*.log
+*.out
+nohup.out
 logs/
+*.bak
 
-# IDE & editor configs (optional - exclude user-specific)
+# OS & Editor
+.DS_Store
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Demo & test payloads (generated/development only)
-test_payload.json
-sample_alert.json
-test_signal*.json
-demo.py
-demo_reasoning_integration.py
+# .md files IGNORED EXCEPT in /docs folder (documentation is centralized)
+*.md
+!README.md
+!PROJECT_STRUCTURE.md
+!docs/**/*.md
+!docs/*.md
+
+# Build Artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test Artifacts (but keep integration tests)
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Generated temporary files
+__init__.py  # Auto-generated, not essential

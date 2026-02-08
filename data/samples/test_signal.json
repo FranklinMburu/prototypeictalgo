@@ -1,0 +1,24 @@
+{
+  "symbol": "BTCUSD",
+  "timeframe": "1H",
+  "signal_type": "CHoCH",
+  "confidence": 85,
+  "timestamp": "2026-02-06T09:30:00Z",
+  "price_data": {
+    "open": 43100,
+    "high": 43500,
+    "low": 42800,
+    "close": 43250
+  },
+  "sl": 42800,
+  "tp": 43500,
+  "multi_tf": {
+    "4H": "bullish",
+    "daily": "neutral"
+  },
+  "confluences": [
+    "support_level",
+    "fibonacci_618",
+    "moving_average_200"
+  ]
+}
