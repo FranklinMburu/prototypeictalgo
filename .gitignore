@@ -13,7 +13,11 @@ nohup.out
 *.log
 *.out
 *.bak
+
+# .md files are IGNORED EXCEPT in /docs folder (documentation)
 *.md
+!docs/**/*.md
+!docs/*.md
 
 # Environment files (Security: API keys, credentials)
 ict_trading_system/.env
