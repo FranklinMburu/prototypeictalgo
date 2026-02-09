@@ -1,0 +1,71 @@
+version: 1
+
+modes:
+  default: "LIVE"  # LIVE | PAPER | SHADOW
+  allow_reasoning: false
+  require_human_approval: false
+
+sessions:
+  timezone: "Africa/Nairobi"
+  killzones:
+    london:
+      enabled: true
+      start: "10:00"     # local time
+      end: "13:00"
+    newyork:
+      enabled: true
+      start: "15:30"
+      end: "18:00"
+  quiet_hours:
+    enabled: true
+    windows:
+      - start: "23:00"
+        end: "06:00"
+
+risk:
+  max_trades_per_day: 10
+  max_trades_per_symbol_per_day: 3
+  max_daily_loss_usd: 100.0
+  max_drawdown_usd: 300.0
+  max_loss_streak: 3
+  cooldown_minutes_after_loss: 20
+  max_slippage_pct: 0.15   # e.g. 0.15% allowed before veto/defer
+  min_rr: 1.5
+
+quality:
+  min_confidence: 75
+  min_confluence_score: 70
+  allowed_models:
+    - "SWEEP_CHOCH_POI"
+    - "SWEEP_BOS_FVG"
+    - "RANGE_LIQUIDITY_RUN_REVERSAL"
+
+regime:
+  enabled: true
+  allowed:
+    - "TREND"
+    - "RANGE"
+  disallow_when:
+    high_volatility: true
+    news_risk: false  # you can wire to a calendar later
+
+outcome_adaptation:
+  enabled: true
+  window_last_n_trades: 50
+  min_sample_size: 20
+  suppress_if:
+    expectancy_r: -0.05
+    win_rate: 0.45
+  promote_if:
+    expectancy_r: 0.10
+    win_rate: 0.55
+  per_symbol: true
+  per_session: true
+  per_model: true
+
+kill_switch:
+  auto_activate_on:
+    reconciliation_mismatch: true
+    broker_disconnect: true
+    drawdown_breach: true
+    daily_loss_breach: true
