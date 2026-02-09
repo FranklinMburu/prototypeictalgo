@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Optional, Dict, Any, List, Tuple, Union
 from types import SimpleNamespace
@@ -26,6 +27,8 @@ from .storage import create_engine_from_env_or_dsn, create_engine_and_sessionmak
 from .alerts import SlackNotifier, DiscordNotifier, TelegramNotifier
 from .metrics import start_metrics_server_if_enabled, decisions_processed_total, deduplicated_decisions_total, dlq_retries_total, dlq_size, redis_reconnect_attempts
 from .logging_setup import logger
+from .metrics_snapshot import load_metrics_snapshot
+from .policy import outcome_policy, memory_policy
 from utils.redis_wrapper import redis_op
 
 _cfg = get_settings()
@@ -130,6 +133,10 @@ class DecisionOrchestrator:
         # policy counters and audit (permissive by default; enabled for Level-2 enforcement)
         self._policy_counters = {"pass": 0, "veto": 0, "defer": 0}
         self._policy_audit = []
+        # outcome metrics snapshot (optional)
+        self._metrics_snapshot = {}
+        # optional constraints loaded by callers/tests (default empty)
+        self._constraints = {}
         # reasoning manager for bounded advisory signal generation
         self.reasoning_manager: Optional[ReasoningManager] = None
         # Stage 4: Reasoning Mode Selector (deterministic mode selection)
@@ -326,8 +333,66 @@ class DecisionOrchestrator:
             except Exception:
                 pass
 
+        # Outcome-aware veto (additive)
+        try:
+            key = (snapshot.get("symbol"), snapshot.get("model"), snapshot.get("session"))
+            outcome_cfg = self._load_outcome_config()
+            result = outcome_policy.check_performance(
+                key,
+                self._metrics_snapshot,
+                min_sample_size=int(outcome_cfg.get("min_sample_size", 20)),
+                expectancy_threshold=float(outcome_cfg.get("expectancy_threshold", -0.05)),
+                win_rate_threshold=float(outcome_cfg.get("win_rate_threshold", 0.45)),
+            )
+            if result.get("result") == "veto":
+                self._policy_counters["veto"] += 1
+                self._policy_audit.append({"type": "outcome", **result, "decision_id": snapshot.get("id")})
+                return {"result": "veto", "reason": result.get("reason", "outcome_underperformance")}
+        except Exception:
+            pass
+
+        # Memory-based veto/promote (additive)
+        try:
+            key = (snapshot.get("symbol"), snapshot.get("model"), snapshot.get("session"))
+            mem_cfg = self._load_memory_config()
+            mem_res = await memory_policy.check_similarity(
+                key,
+                self._lookup_similar_signals,
+                top_n=int(mem_cfg.get("memory_top_n", 10)),
+                negative_threshold=float(mem_cfg.get("negative_threshold", -0.05)),
+                positive_threshold=float(mem_cfg.get("positive_threshold", 0.10)),
+            )
+            if mem_res.get("result") == "veto":
+                self._policy_counters["veto"] += 1
+                self._policy_audit.append({"type": "memory", **mem_res, "decision_id": snapshot.get("id")})
+                return {"result": "veto", "reason": mem_res.get("reason", "memory_underperformance")}
+            if mem_res.get("result") == "promote":
+                try:
+                    ctx = snapshot.setdefault("context", {})
+                    ctx["memory_promoted"] = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         self._policy_counters["pass"] += 1
         return {"result": "pass"}
+
+    def _load_outcome_config(self) -> Dict[str, Any]:
+        return getattr(self, "_constraints", {}).get("outcome_veto", {})
+
+    def _load_memory_config(self) -> Dict[str, Any]:
+        return getattr(self, "_constraints", {}).get("memory_veto", {})
+
+    async def _lookup_similar_signals(
+        self, key: Tuple[str, str, str], top_n: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Return up to `top_n` past signals similar to the given (symbol, model, session).
+        Each returned dict must include an 'r_multiple' for expectancy.
+        This delegates to your MemoryStore API (e.g. self.memory_store.query()).
+        """
+        return []
 
     # --- Policy gate: post-reasoning hook ---
     async def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -470,6 +535,13 @@ class DecisionOrchestrator:
             "telegram": TelegramNotifier(_cfg.TELEGRAM_TOKEN, _cfg.TELEGRAM_CHAT_ID, engine=self.engine),
         }
         start_metrics_server_if_enabled()
+        # load optional metrics snapshot for outcome-aware policy
+        try:
+            metrics_path = os.getenv("METRICS_SNAPSHOT_PATH", "")
+            if metrics_path:
+                self._metrics_snapshot = load_metrics_snapshot(metrics_path)
+        except Exception:
+            pass
         # setup optional Redis DLQ with backoff
         try:
             if _cfg.REDIS_DLQ_ENABLED and aioredis is not None:
@@ -1478,6 +1550,4 @@ class DecisionOrchestrator:
                         logger.warning("DLQ retry failed for symbol=%s attempts=%d next_attempt_in=%.1fs error=%s", decision.get("symbol"), attempts, delay, str(e))
             except Exception:
                 logger.exception("unexpected error processing DLQ entry")
-
-
 

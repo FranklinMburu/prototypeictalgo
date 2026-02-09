@@ -49,6 +49,29 @@ regime:
     high_volatility: true
     news_risk: false  # you can wire to a calendar later
 
+##
+# Outcome Veto Configuration
+#
+# These settings control the outcome-aware policy gate. When enabled
+# the orchestrator will consult historical performance metrics and
+# veto trades whose expectancy or win rate fall below the thresholds.
+# The minimum sample size prevents spurious decisions on small data sets.
+outcome_veto:
+  min_sample_size: 20
+  expectancy_threshold: -0.05
+  win_rate_threshold: 0.45
+
+
+##
+# Memory Veto/Promote Configuration
+# Controls the memory-based policy gate. Negative expectancy below this
+# threshold triggers a veto; positive expectancy above the positive
+# threshold can trigger a promote.
+memory_veto:
+  memory_top_n: 10
+  negative_threshold: -0.05
+  positive_threshold: 0.10
+
 outcome_adaptation:
   enabled: true
   window_last_n_trades: 50
