@@ -100,9 +100,13 @@ class DecisionOutcome(Base):
     - symbol: Trading pair symbol (e.g., "EURUSD")
     - timeframe: Timeframe of the signal (e.g., "4H", "1D")
     - signal_type: Type of signal (e.g., "bullish_choch", "bearish_bos")
+    - model: AI model identifier (e.g., "v1.0", "gpt4")
+    - session: Trading session identifier (e.g., "London", "NewYork")
+    - direction: Trade direction (e.g., "long", "short")
     - entry_price: Price at which trade was entered
     - exit_price: Price at which trade was exited (when closed_at is recorded)
     - pnl: Profit/loss in currency or pips
+    - r_multiple: Risk multiple (e.g., 2.5 for a 2.5:1 win)
     - outcome: Trade result - "win" (pnl > 0), "loss" (pnl < 0), "breakeven" (pnl == 0)
     - exit_reason: Why trade closed - "tp" (take profit), "sl" (stop loss), "manual", "timeout"
     - closed_at: UTC timestamp when the trade was closed
@@ -113,9 +117,13 @@ class DecisionOutcome(Base):
     symbol = Column(String, nullable=False, index=True)
     timeframe = Column(String, nullable=False)
     signal_type = Column(String, nullable=False)
+    model = Column(String, nullable=True, index=True)  # Optional: AI model identifier
+    session = Column(String, nullable=True, index=True)  # Optional: trading session
+    direction = Column(String, nullable=True)  # Optional: "long" or "short"
     entry_price = Column(Float, nullable=False)
     exit_price = Column(Float, nullable=False)
     pnl = Column(Float, nullable=False)
+    r_multiple = Column(Float, nullable=True)  # Risk multiple for outcome-aware veto
     outcome = Column(String, nullable=False)  # "win", "loss", "breakeven"
     exit_reason = Column(String, nullable=False)  # "tp", "sl", "manual", "timeout"
     closed_at = Column(DateTime, nullable=False)
@@ -201,6 +209,10 @@ async def insert_decision_outcome(
     outcome: str,  # "win" | "loss" | "breakeven"
     exit_reason: str,  # "tp" | "sl" | "manual" | "timeout"
     closed_at: datetime.datetime,
+    model: str = None,
+    session_id: str = None,
+    direction: str = None,
+    r_multiple: float = None,
 ) -> str:
     """
     Insert a trade outcome record linked to a decision.
@@ -217,6 +229,10 @@ async def insert_decision_outcome(
         outcome: Result classification ("win", "loss", "breakeven")
         exit_reason: Exit reason ("tp", "sl", "manual", "timeout")
         closed_at: Trade close timestamp (UTC)
+        model: Optional AI model identifier
+        session_id: Optional trading session identifier
+        direction: Optional trade direction ("long" or "short")
+        r_multiple: Optional risk multiple for outcome-aware policies
     
     Returns:
         outcome_id: UUID string of inserted DecisionOutcome record
@@ -244,6 +260,10 @@ async def insert_decision_outcome(
             outcome=outcome,
             exit_reason=exit_reason,
             closed_at=closed_at,
+            model=model,
+            session=session_id,
+            direction=direction,
+            r_multiple=r_multiple,
         )
         session.add(outcome_rec)
         await session.commit()
@@ -345,28 +365,47 @@ async def get_outcomes_by_signal_type(
     symbol: str,
     signal_type: str,
     limit: int = 100,
+    model: str = None,
+    session_id: str = None,
+    direction: str = None,
 ) -> List[dict]:
     """
-    Retrieve outcomes for a specific symbol + signal_type, ordered by closed_at DESC.
+    Retrieve outcomes for a specific symbol + signal_type (+ optional model/session/direction).
+    Ordered by closed_at DESC.
     
-    This enables memory-based veto for recurring signal patterns.
+    This enables memory-based veto for recurring signal patterns, with support for
+    multi-dimensional grouping (model, session, direction).
     
     Args:
         sessionmaker: Async session factory
         symbol: Trading symbol (e.g., "EURUSD")
         signal_type: Signal type (e.g., "bullish_choch", "bearish_bos")
         limit: Max outcomes to return
+        model: Optional AI model identifier to filter by
+        session_id: Optional trading session (e.g., "London") to filter by
+        direction: Optional trade direction ("long"/"short") to filter by
     
     Returns:
-        List of outcome dicts with pnl, outcome (win/loss/breakeven), etc.
+        List of outcome dicts with r_multiple, outcome, pnl, etc.
     """
     async with sessionmaker() as session:
+        # Start with base filters
+        filters = [
+            DecisionOutcome.symbol == symbol,
+            DecisionOutcome.signal_type == signal_type,
+        ]
+        
+        # Add optional filters for model, session, direction
+        if model is not None:
+            filters.append(DecisionOutcome.model == model)
+        if session_id is not None:
+            filters.append(DecisionOutcome.session == session_id)
+        if direction is not None:
+            filters.append(DecisionOutcome.direction == direction)
+        
         result = await session.execute(
             select(DecisionOutcome)
-            .where(
-                (DecisionOutcome.symbol == symbol) &
-                (DecisionOutcome.signal_type == signal_type)
-            )
+            .where(*filters if filters else True)
             .order_by(DecisionOutcome.closed_at.desc())
             .limit(limit)
         )

@@ -384,6 +384,9 @@ class DecisionOrchestrator:
             if outcome_adapt_cfg.get("enabled", False):
                 symbol = snapshot.get("symbol")
                 signal_type = snapshot.get("signal_type")
+                model = snapshot.get("model")
+                session = snapshot.get("session")
+                direction = snapshot.get("direction")
                 
                 if symbol and signal_type and self._sessionmaker:
                     window_n = int(outcome_adapt_cfg.get("window_last_n_trades", 50))
@@ -391,53 +394,65 @@ class DecisionOrchestrator:
                     suppress_expectancy = float(outcome_adapt_cfg.get("suppress_if", {}).get("expectancy_r", -0.05))
                     suppress_win_rate = float(outcome_adapt_cfg.get("suppress_if", {}).get("win_rate", 0.45))
                     
-                    # Query recent outcomes for this symbol + signal_type
+                    # Query recent outcomes for this symbol + signal_type (+ optional model/session/direction)
                     outcomes = await get_outcomes_by_signal_type(
                         self._sessionmaker,
                         symbol=symbol,
                         signal_type=signal_type,
                         limit=window_n,
+                        model=model,
+                        session_id=session,
+                        direction=direction,
                     )
                     
-                    if outcomes and len(outcomes) >= min_sample:
-                        # Convert outcomes to r_multiple format
+                    if outcomes:
+                        # Extract only outcomes with valid r_multiple (ignore missing/invalid)
                         outcome_list = []
                         for o in outcomes:
+                            r_mult = o.get("r_multiple")
                             outcome_type = o.get("outcome", "").lower()
-                            pnl = float(o.get("pnl", 0.0))
-                            # Convert to r_multiple: normalize by 10 (configurable in future)
-                            if outcome_type == "win":
-                                r_mult = max(1.0, pnl / 10.0)
-                            elif outcome_type == "loss":
-                                r_mult = min(-1.0, pnl / 10.0)
-                            else:
-                                r_mult = 0.0
-                            outcome_list.append({"r_multiple": r_mult, "outcome": outcome_type})
+                            # Only include if r_multiple is present and numeric
+                            if r_mult is not None and isinstance(r_mult, (int, float)):
+                                outcome_list.append({"r_multiple": float(r_mult), "outcome": outcome_type})
                         
+                        # Compute metrics for all outcomes with valid r_multiple
                         expectancy, win_rate, sample_size = self._compute_expectancy_and_win_rate(outcome_list)
-                        
-                        # Veto if underperforming
-                        if expectancy < suppress_expectancy or win_rate < suppress_win_rate:
-                            self._policy_counters["veto"] += 1
-                            details = {
-                                "expectancy": expectancy,
-                                "win_rate": win_rate,
-                                "sample_size": sample_size,
-                                "thresholds": {
-                                    "expectancy_threshold": suppress_expectancy,
-                                    "win_rate_threshold": suppress_win_rate,
-                                }
+                        details = {
+                            "expectancy": expectancy,
+                            "win_rate": win_rate,
+                            "sample_size": sample_size,
+                            "thresholds": {
+                                "expectancy_threshold": suppress_expectancy,
+                                "win_rate_threshold": suppress_win_rate,
                             }
-                            self._policy_audit.append({
-                                "type": "memory_recall",
-                                "reason": "memory_underperformance",
-                                "decision_id": snapshot.get("id"),
-                                **details
-                            })
-                            logger.warning(f"Memory recall veto: {symbol}/{signal_type} expectancy={expectancy:.2f}, wr={win_rate:.2f}")
+                        }
+                        
+                        # Veto only if we have sufficient sample size of valid outcomes AND poor performance
+                        if sample_size >= min_sample:
+                            if expectancy < suppress_expectancy or win_rate < suppress_win_rate:
+                                self._policy_counters["veto"] += 1
+                                self._policy_audit.append({
+                                    "type": "memory_recall",
+                                    "reason": "memory_underperformance",
+                                    "decision_id": snapshot.get("id"),
+                                    **details
+                                })
+                                logger.warning(f"Memory recall veto: {symbol}/{signal_type} model={model} session={session} direction={direction} expectancy={expectancy:.2f}, wr={win_rate:.2f}")
+                                return {
+                                    "result": "veto",
+                                    "reason": "memory_underperformance",
+                                    "details": details
+                                }
+                            else:
+                                # Good performance, pass
+                                return {
+                                    "result": "pass",
+                                    "details": details
+                                }
+                        else:
+                            # Insufficient sample size, pass
                             return {
-                                "result": "veto",
-                                "reason": "memory_underperformance",
+                                "result": "pass",
                                 "details": details
                             }
         except Exception as e:
@@ -445,7 +460,8 @@ class DecisionOrchestrator:
             # Fail open: log warning but continue
 
         self._policy_counters["pass"] += 1
-        return {"result": "pass"}
+        # Return pass with empty details if no memory adaptation occurred
+        return {"result": "pass", "details": {"sample_size": 0, "expectancy": 0.0, "win_rate": 0.0}}
 
     def _load_outcome_config(self) -> Dict[str, Any]:
         return getattr(self, "_constraints", {}).get("outcome_veto", {})

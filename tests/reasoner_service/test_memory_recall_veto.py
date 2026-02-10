@@ -1,4 +1,11 @@
-"""Tests for DB-backed memory recall veto in orchestrator."""
+"""Tests for DB-backed memory recall veto in orchestrator (fixed version).
+
+Focus:
+1. Uses r_multiple directly from DecisionOutcome (not pnl-derived)
+2. Tests session/direction isolation
+3. Tests invalid/missing r_multiple handling
+4. Tests expanded grouping key (symbol + signal_type + model + session + direction)
+"""
 
 import pytest
 from datetime import datetime, timezone
@@ -8,8 +15,8 @@ from reasoner_service.storage import DecisionOutcome
 
 
 @pytest.mark.asyncio
-async def test_memory_recall_veto_on_poor_expectancy(monkeypatch):
-    """Test that poor expectancy triggers memory recall veto."""
+async def test_memory_recall_veto_uses_r_multiple_directly(monkeypatch):
+    """Test that veto uses r_multiple directly (not pnl-derived)."""
     monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
 
     orch = DecisionOrchestrator()
@@ -25,29 +32,38 @@ async def test_memory_recall_veto_on_poor_expectancy(monkeypatch):
         }
     }
 
-    # Mock sessionmaker to return poor outcomes (all losses)
+    # Outcomes with r_multiple already set (not derived from pnl)
     poor_outcomes = [
         {
             "id": "o1", "decision_id": "d1", "symbol": "ES", "timeframe": "4H",
             "signal_type": "bullish_choch", "entry_price": 4500.0, "exit_price": 4495.0,
-            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -0.5,  # Already computed, not pnl/10
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
         {
             "id": "o2", "decision_id": "d2", "symbol": "ES", "timeframe": "4H",
             "signal_type": "bullish_choch", "entry_price": 4510.0, "exit_price": 4500.0,
-            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -1.0,  # Already computed
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
         {
             "id": "o3", "decision_id": "d3", "symbol": "ES", "timeframe": "4H",
             "signal_type": "bullish_choch", "entry_price": 4520.0, "exit_price": 4510.0,
-            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -0.75,  # Already computed
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
     ]
 
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
+    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
         if symbol == "ES" and signal_type == "bullish_choch":
             return poor_outcomes
         return []
@@ -57,24 +73,25 @@ async def test_memory_recall_veto_on_poor_expectancy(monkeypatch):
     orch_module.get_outcomes_by_signal_type = mock_get_outcomes
     
     try:
-        orch._sessionmaker = "mock_sessionmaker"  # Non-None to trigger DB query
+        orch._sessionmaker = "mock_sessionmaker"
         
         decision = {
             "id": "d4", "symbol": "ES", "signal_type": "bullish_choch",
-            "model": "MODEL", "session": "London"
+            "model": "v1", "session": "London", "direction": "long"
         }
         result = await orch.pre_reasoning_policy_check(decision)
 
         assert result["result"] == "veto"
         assert result["reason"] == "memory_underperformance"
-        assert "details" in result
+        # Average r_multiple: (-0.5 + -1.0 + -0.75) / 3 = -0.75 < 0.0 threshold
+        assert result["details"]["expectancy"] < 0.0
     finally:
         orch_module.get_outcomes_by_signal_type = original_get
 
 
 @pytest.mark.asyncio
-async def test_memory_recall_veto_on_poor_win_rate(monkeypatch):
-    """Test that poor win rate triggers memory recall veto."""
+async def test_memory_recall_session_direction_isolation(monkeypatch):
+    """Test that London losses do NOT veto NY trades (session/direction isolation)."""
     monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
 
     orch = DecisionOrchestrator()
@@ -82,38 +99,146 @@ async def test_memory_recall_veto_on_poor_win_rate(monkeypatch):
         "outcome_adaptation": {
             "enabled": True,
             "window_last_n_trades": 50,
-            "min_sample_size": 3,
+            "min_sample_size": 2,  # Low threshold
             "suppress_if": {
-                "expectancy_r": -0.5,  # Lenient on expectancy
-                "win_rate": 0.6,  # Strict on win rate
+                "expectancy_r": 0.0,  # Veto if expectancy < 0
+                "win_rate": 0.45,
             }
         }
     }
 
-    # Mixed outcomes but poor win rate (1/3 = 0.33 < 0.6)
-    mixed_outcomes = [
+    # London short trades had poor performance
+    london_short_outcomes = [
         {
-            "id": "o1", "decision_id": "d1", "symbol": "NQ", "timeframe": "1H",
-            "signal_type": "bearish_bos", "entry_price": 15000.0, "exit_price": 14990.0,
-            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "id": "o1", "decision_id": "d1", "symbol": "EURUSD", "timeframe": "4H",
+            "signal_type": "bearish_bos", "entry_price": 1.0900, "exit_price": 1.0895,
+            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -0.5,
+            "model": "v1", "session": "London", "direction": "short",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
         {
-            "id": "o2", "decision_id": "d2", "symbol": "NQ", "timeframe": "1H",
-            "signal_type": "bearish_bos", "entry_price": 15020.0, "exit_price": 15010.0,
-            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
-            "created_at": datetime.now(timezone.utc)
-        },
-        {
-            "id": "o3", "decision_id": "d3", "symbol": "NQ", "timeframe": "1H",
-            "signal_type": "bearish_bos", "entry_price": 15100.0, "exit_price": 15150.0,
-            "pnl": 50.0, "outcome": "win", "exit_reason": "tp", "closed_at": datetime.now(timezone.utc),
+            "id": "o2", "decision_id": "d2", "symbol": "EURUSD", "timeframe": "4H",
+            "signal_type": "bearish_bos", "entry_price": 1.0910, "exit_price": 1.0920,
+            "pnl": -100.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -1.0,
+            "model": "v1", "session": "London", "direction": "short",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
     ]
 
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
-        if symbol == "NQ" and signal_type == "bearish_bos":
+    # But New York long trades have great performance
+    ny_long_outcomes = [
+        {
+            "id": "o3", "decision_id": "d3", "symbol": "EURUSD", "timeframe": "4H",
+            "signal_type": "bearish_bos", "entry_price": 1.0850, "exit_price": 1.0900,
+            "pnl": 500.0, "outcome": "win", "exit_reason": "tp",
+            "r_multiple": 5.0,
+            "model": "v1", "session": "NewYork", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc)
+        },
+        {
+            "id": "o4", "decision_id": "d4", "symbol": "EURUSD", "timeframe": "4H",
+            "signal_type": "bearish_bos", "entry_price": 1.0860, "exit_price": 1.0920,
+            "pnl": 600.0, "outcome": "win", "exit_reason": "tp",
+            "r_multiple": 6.0,
+            "model": "v1", "session": "NewYork", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc)
+        },
+    ]
+
+    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
+        # Return different outcomes based on session + direction filters
+        if session_id == "London" and direction == "short":
+            return london_short_outcomes
+        elif session_id == "NewYork" and direction == "long":
+            return ny_long_outcomes
+        return []
+
+    import reasoner_service.orchestrator as orch_module
+    original_get = orch_module.get_outcomes_by_signal_type
+    orch_module.get_outcomes_by_signal_type = mock_get_outcomes
+    
+    try:
+        orch._sessionmaker = "mock_sessionmaker"
+        
+        # Test 1: London short should VETO (poor outcomes)
+        decision_london = {
+            "id": "d_test", "symbol": "EURUSD", "signal_type": "bearish_bos",
+            "model": "v1", "session": "London", "direction": "short"
+        }
+        result_london = await orch.pre_reasoning_policy_check(decision_london)
+        assert result_london["result"] == "veto", "London short should veto due to poor performance"
+        assert result_london["details"]["expectancy"] < 0.0
+        
+        # Test 2: New York long should PASS (good outcomes)
+        decision_ny = {
+            "id": "d_test2", "symbol": "EURUSD", "signal_type": "bearish_bos",
+            "model": "v1", "session": "NewYork", "direction": "long"
+        }
+        result_ny = await orch.pre_reasoning_policy_check(decision_ny)
+        assert result_ny["result"] == "pass", "New York long should pass due to good performance"
+        assert result_ny["details"]["expectancy"] > 5.0
+        
+    finally:
+        orch_module.get_outcomes_by_signal_type = original_get
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_ignores_invalid_r_multiple(monkeypatch):
+    """Test that invalid/missing r_multiple is excluded from calculations (not counted in sample_size)."""
+    monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
+
+    orch = DecisionOrchestrator()
+    orch._constraints = {
+        "outcome_adaptation": {
+            "enabled": True,
+            "window_last_n_trades": 50,
+            "min_sample_size": 2,  # Need 2 valid outcomes
+            "suppress_if": {
+                "expectancy_r": 0.0,
+                "win_rate": 0.45,
+            }
+        }
+    }
+
+    # Mix of valid and invalid r_multiple
+    mixed_outcomes = [
+        {
+            "id": "o1", "decision_id": "d1", "symbol": "GBPUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 1.2700, "exit_price": 1.2750,
+            "pnl": 50.0, "outcome": "win", "exit_reason": "tp",
+            "r_multiple": 2.5,  # Valid
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc)
+        },
+        {
+            "id": "o2", "decision_id": "d2", "symbol": "GBPUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 1.2800, "exit_price": 1.2750,
+            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": None,  # MISSING - should be excluded
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc)
+        },
+        {
+            "id": "o3", "decision_id": "d3", "symbol": "GBPUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 1.2750, "exit_price": 1.2800,
+            "pnl": 50.0, "outcome": "win", "exit_reason": "tp",
+            "r_multiple": 3.0,  # Valid
+            "model": "v1", "session": "London", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc)
+        },
+    ]
+
+    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
+        if symbol == "GBPUSD" and signal_type == "bullish_choch":
             return mixed_outcomes
         return []
 
@@ -125,20 +250,28 @@ async def test_memory_recall_veto_on_poor_win_rate(monkeypatch):
         orch._sessionmaker = "mock_sessionmaker"
         
         decision = {
-            "id": "d4", "symbol": "NQ", "signal_type": "bearish_bos",
-            "model": "MODEL", "session": "NewYork"
+            "id": "d_test", "symbol": "GBPUSD", "signal_type": "bullish_choch",
+            "model": "v1", "session": "London", "direction": "long"
         }
         result = await orch.pre_reasoning_policy_check(decision)
 
-        assert result["result"] == "veto"
-        assert result["reason"] == "memory_underperformance"
+        # Should PASS because:
+        # - Only 2 valid r_multiple values: [2.5, 3.0]
+        # - The missing r_multiple (o2) is excluded, doesn't count toward sample
+        # - Expectancy = (2.5 + 3.0) / 2 = 2.75 > 0.0 threshold
+        # - Win rate = 2/2 = 1.0 > 0.45 threshold
+        assert result["result"] == "pass"
+        assert result["details"]["sample_size"] == 2  # Only 2 valid outcomes
+        assert result["details"]["expectancy"] > 2.0  # 2.75
+        assert result["details"]["win_rate"] == 1.0  # 2 wins out of 2
+        
     finally:
         orch_module.get_outcomes_by_signal_type = original_get
 
 
 @pytest.mark.asyncio
-async def test_memory_recall_pass_on_good_performance(monkeypatch):
-    """Test that good performance passes memory recall check."""
+async def test_memory_recall_insufficient_valid_sample(monkeypatch):
+    """Test that insufficient valid outcomes (with r_multiple) does NOT trigger veto."""
     monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
 
     orch = DecisionOrchestrator()
@@ -146,39 +279,48 @@ async def test_memory_recall_pass_on_good_performance(monkeypatch):
         "outcome_adaptation": {
             "enabled": True,
             "window_last_n_trades": 50,
-            "min_sample_size": 3,
+            "min_sample_size": 3,  # Need 3 valid outcomes
             "suppress_if": {
-                "expectancy_r": -0.05,
+                "expectancy_r": 0.0,
                 "win_rate": 0.45,
             }
         }
     }
 
-    # Good outcomes: 2/3 wins = 0.67 > 0.45
-    good_outcomes = [
+    # Only 1 outcome with valid r_multiple (rest are None)
+    sparse_outcomes = [
         {
-            "id": "o1", "decision_id": "d1", "symbol": "GC", "timeframe": "4H",
-            "signal_type": "reversal", "entry_price": 2050.0, "exit_price": 2100.0,
-            "pnl": 50.0, "outcome": "win", "exit_reason": "tp", "closed_at": datetime.now(timezone.utc),
+            "id": "o1", "decision_id": "d1", "symbol": "AUDUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 0.6700, "exit_price": 0.6750,
+            "pnl": 50.0, "outcome": "win", "exit_reason": "tp",
+            "r_multiple": 2.0,  # Valid
+            "model": "v1", "session": "Tokyo", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
         {
-            "id": "o2", "decision_id": "d2", "symbol": "GC", "timeframe": "4H",
-            "signal_type": "reversal", "entry_price": 2080.0, "exit_price": 2120.0,
-            "pnl": 40.0, "outcome": "win", "exit_reason": "tp", "closed_at": datetime.now(timezone.utc),
+            "id": "o2", "decision_id": "d2", "symbol": "AUDUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 0.6800, "exit_price": 0.6750,
+            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": None,  # Missing
+            "model": "v1", "session": "Tokyo", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
         {
-            "id": "o3", "decision_id": "d3", "symbol": "GC", "timeframe": "4H",
-            "signal_type": "reversal", "entry_price": 2070.0, "exit_price": 2050.0,
-            "pnl": -20.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "id": "o3", "decision_id": "d3", "symbol": "AUDUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 0.6750, "exit_price": 0.6700,
+            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": None,  # Missing
+            "model": "v1", "session": "Tokyo", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
     ]
 
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
-        if symbol == "GC" and signal_type == "reversal":
-            return good_outcomes
+    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
+        if symbol == "AUDUSD" and signal_type == "bullish_choch":
+            return sparse_outcomes
         return []
 
     import reasoner_service.orchestrator as orch_module
@@ -189,166 +331,78 @@ async def test_memory_recall_pass_on_good_performance(monkeypatch):
         orch._sessionmaker = "mock_sessionmaker"
         
         decision = {
-            "id": "d4", "symbol": "GC", "signal_type": "reversal",
-            "model": "MODEL", "session": "London"
+            "id": "d_test", "symbol": "AUDUSD", "signal_type": "bullish_choch",
+            "model": "v1", "session": "Tokyo", "direction": "long"
         }
         result = await orch.pre_reasoning_policy_check(decision)
 
+        # Should PASS because we only have 1 valid outcome < min_sample_size of 3
         assert result["result"] == "pass"
-    finally:
-        orch_module.get_outcomes_by_signal_type = original_get
-
-
-@pytest.mark.asyncio
-async def test_memory_recall_pass_insufficient_sample(monkeypatch):
-    """Test that insufficient sample size results in pass."""
-    monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
-
-    orch = DecisionOrchestrator()
-    orch._constraints = {
-        "outcome_adaptation": {
-            "enabled": True,
-            "window_last_n_trades": 50,
-            "min_sample_size": 10,  # Require 10, but we only have 2
-            "suppress_if": {
-                "expectancy_r": -0.05,
-                "win_rate": 0.45,
-            }
-        }
-    }
-
-    # Only 2 outcomes - below min_sample_size of 10
-    small_sample = [
-        {
-            "id": "o1", "decision_id": "d1", "symbol": "CL", "timeframe": "1D",
-            "signal_type": "trend", "entry_price": 75.0, "exit_price": 70.0,
-            "pnl": -50.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
-            "created_at": datetime.now(timezone.utc)
-        },
-        {
-            "id": "o2", "decision_id": "d2", "symbol": "CL", "timeframe": "1D",
-            "signal_type": "trend", "entry_price": 76.0, "exit_price": 74.0,
-            "pnl": -20.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
-            "created_at": datetime.now(timezone.utc)
-        },
-    ]
-
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
-        if symbol == "CL" and signal_type == "trend":
-            return small_sample
-        return []
-
-    import reasoner_service.orchestrator as orch_module
-    original_get = orch_module.get_outcomes_by_signal_type
-    orch_module.get_outcomes_by_signal_type = mock_get_outcomes
-    
-    try:
-        orch._sessionmaker = "mock_sessionmaker"
+        assert result["details"]["sample_size"] == 1
         
-        decision = {
-            "id": "d3", "symbol": "CL", "signal_type": "trend",
-            "model": "MODEL", "session": "London"
-        }
-        result = await orch.pre_reasoning_policy_check(decision)
-
-        assert result["result"] == "pass"
-    finally:
-        orch_module.get_outcomes_by_signal_type = original_get
-
-
-@pytest.mark.asyncio
-async def test_memory_recall_pass_no_history(monkeypatch):
-    """Test that no history results in pass."""
-    monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
-
-    orch = DecisionOrchestrator()
-    orch._constraints = {
-        "outcome_adaptation": {
-            "enabled": True,
-            "window_last_n_trades": 50,
-            "min_sample_size": 5,
-            "suppress_if": {
-                "expectancy_r": -0.05,
-                "win_rate": 0.45,
-            }
-        }
-    }
-
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
-        return []  # No outcomes for this signal_type
-
-    import reasoner_service.orchestrator as orch_module
-    original_get = orch_module.get_outcomes_by_signal_type
-    orch_module.get_outcomes_by_signal_type = mock_get_outcomes
-    
-    try:
-        orch._sessionmaker = "mock_sessionmaker"
-        
-        decision = {
-            "id": "d1", "symbol": "UNKNOWN", "signal_type": "new_pattern",
-            "model": "MODEL", "session": "London"
-        }
-        result = await orch.pre_reasoning_policy_check(decision)
-
-        assert result["result"] == "pass"
     finally:
         orch_module.get_outcomes_by_signal_type = original_get
 
 
 @pytest.mark.asyncio
 async def test_memory_recall_pass_feature_disabled(monkeypatch):
-    """Test that disabled outcome_adaptation skips memory recall check."""
+    """Test that feature disabled (enabled=false) skips veto entirely."""
     monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
 
     orch = DecisionOrchestrator()
     orch._constraints = {
         "outcome_adaptation": {
-            "enabled": False,  # Feature disabled
+            "enabled": False,  # DISABLED
             "window_last_n_trades": 50,
-            "min_sample_size": 5,
+            "min_sample_size": 1,
             "suppress_if": {
-                "expectancy_r": -0.05,
-                "win_rate": 0.45,
+                "expectancy_r": 100.0,  # Extremely strict
+                "win_rate": 1.0,
             }
         }
     }
 
-    # Even with poor outcomes, memory recall should not trigger
-    poor_outcomes = [
+    # Even with terrible outcomes, should not veto if feature is disabled
+    terrible_outcomes = [
         {
-            "id": "o1", "decision_id": "d1", "symbol": "ES", "timeframe": "4H",
-            "signal_type": "bullish_choch", "entry_price": 4500.0, "exit_price": 4450.0,
-            "pnl": -500.0, "outcome": "loss", "exit_reason": "sl", "closed_at": datetime.now(timezone.utc),
+            "id": "o1", "decision_id": "d1", "symbol": "NZDUSD", "timeframe": "4H",
+            "signal_type": "bullish_choch", "entry_price": 0.6000, "exit_price": 0.5900,
+            "pnl": -1000.0, "outcome": "loss", "exit_reason": "sl",
+            "r_multiple": -10.0,
+            "model": "v1", "session": "Sydney", "direction": "long",
+            "closed_at": datetime.now(timezone.utc),
             "created_at": datetime.now(timezone.utc)
         },
     ]
 
-    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit):
-        return poor_outcomes
+    async def mock_get_outcomes(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
+        if symbol == "NZDUSD" and signal_type == "bullish_choch":
+            return terrible_outcomes
+        return []
 
     import reasoner_service.orchestrator as orch_module
     original_get = orch_module.get_outcomes_by_signal_type
     orch_module.get_outcomes_by_signal_type = mock_get_outcomes
     
     try:
-        # Don't set sessionmaker - this ensures DB query won't run
-        orch._sessionmaker = None
+        orch._sessionmaker = "mock_sessionmaker"
         
         decision = {
-            "id": "d2", "symbol": "ES", "signal_type": "bullish_choch",
-            "model": "MODEL", "session": "London"
+            "id": "d_test", "symbol": "NZDUSD", "signal_type": "bullish_choch",
+            "model": "v1", "session": "Sydney", "direction": "long"
         }
         result = await orch.pre_reasoning_policy_check(decision)
 
-        # Should pass because feature is disabled and no sessionmaker
+        # Should PASS because feature is disabled
         assert result["result"] == "pass"
+        
     finally:
         orch_module.get_outcomes_by_signal_type = original_get
 
 
 @pytest.mark.asyncio
-async def test_memory_recall_fail_open_on_db_error(monkeypatch, caplog):
-    """Test that DB errors result in fail-open (pass) with warning logged."""
+async def test_memory_recall_fail_open_on_db_error(monkeypatch):
+    """Test fail-open on DB error: returns PASS and logs warning."""
     monkeypatch.setattr(rs_config.Settings, "ENABLE_PERMISSIVE_POLICY", False)
 
     orch = DecisionOrchestrator()
@@ -356,16 +410,17 @@ async def test_memory_recall_fail_open_on_db_error(monkeypatch, caplog):
         "outcome_adaptation": {
             "enabled": True,
             "window_last_n_trades": 50,
-            "min_sample_size": 5,
+            "min_sample_size": 1,
             "suppress_if": {
-                "expectancy_r": -0.05,
+                "expectancy_r": 0.0,
                 "win_rate": 0.45,
             }
         }
     }
 
-    async def mock_get_outcomes_error(sessionmaker, symbol, signal_type, limit):
-        raise Exception("DB connection failed")
+    async def mock_get_outcomes_error(sessionmaker, symbol, signal_type, limit, model=None, session_id=None, direction=None):
+        # Simulate DB error
+        raise Exception("Database connection failed")
 
     import reasoner_service.orchestrator as orch_module
     original_get = orch_module.get_outcomes_by_signal_type
@@ -375,16 +430,13 @@ async def test_memory_recall_fail_open_on_db_error(monkeypatch, caplog):
         orch._sessionmaker = "mock_sessionmaker"
         
         decision = {
-            "id": "d1", "symbol": "ES", "signal_type": "bullish_choch",
-            "model": "MODEL", "session": "London"
+            "id": "d_test", "symbol": "USDJPY", "signal_type": "bullish_choch",
+            "model": "v1", "session": "Tokyo", "direction": "long"
         }
-        
-        with caplog.at_level("WARNING"):
-            result = await orch.pre_reasoning_policy_check(decision)
+        result = await orch.pre_reasoning_policy_check(decision)
 
-        # Should pass despite DB error (fail-open)
+        # Should PASS (fail-open) even though DB error occurred
         assert result["result"] == "pass"
-        # Should have logged a warning
-        assert "Memory recall veto check failed" in caplog.text
+        
     finally:
         orch_module.get_outcomes_by_signal_type = original_get

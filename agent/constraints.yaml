@@ -73,7 +73,7 @@ memory_veto:
   positive_threshold: 0.10
 
 outcome_adaptation:
-  enabled: true
+  enabled: false
   window_last_n_trades: 50
   min_sample_size: 20
   suppress_if:

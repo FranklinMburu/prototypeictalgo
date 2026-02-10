@@ -61,6 +61,10 @@ class DecisionOutcomeRecorder:
         pnl: float,
         exit_reason: str = "manual",  # "tp", "sl", "manual", "timeout"
         closed_at: Optional[datetime] = None,
+        model: str = None,
+        session_id: str = None,
+        direction: str = None,
+        r_multiple: float = None,
     ) -> Optional[str]:
         """
         Record a trade outcome when a trade closes.
@@ -80,6 +84,10 @@ class DecisionOutcomeRecorder:
             exit_reason: Reason for exit - "tp" (take profit), "sl" (stop loss),
                         "manual" (manually closed), "timeout" (time-based exit)
             closed_at: UTC timestamp when trade closed. Defaults to now().
+            model: Optional AI model identifier
+            session_id: Optional trading session identifier
+            direction: Optional trade direction (\"long\" or \"short\")
+            r_multiple: Optional risk multiple for outcome-aware policies
         
         Returns:
             outcome_id: UUID of the DecisionOutcome record, or None on error
@@ -98,8 +106,10 @@ class DecisionOutcomeRecorder:
             ...     entry_price=1.0850,
             ...     exit_price=1.0900,
             ...     pnl=50.0,
-            ...     exit_reason="tp",
-            ... )
+            ...     exit_reason="tp",            ...     model=\"v1\",
+            ...     session_id=\"London\",
+            ...     direction=\"long\",
+            ...     r_multiple=2.5,            ... )
         """
         # Use current UTC time if not provided
         closed_at = closed_at or datetime.now(timezone.utc)
@@ -133,6 +143,10 @@ class DecisionOutcomeRecorder:
                 outcome=outcome,
                 exit_reason=exit_reason,
                 closed_at=closed_at,
+                model=model,
+                session_id=session_id,
+                direction=direction,
+                r_multiple=r_multiple,
             )
 
             logger.info(

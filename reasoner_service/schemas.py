@@ -95,6 +95,10 @@ class DecisionOutcomeBase(BaseModel):
     outcome: str  # "win", "loss", "breakeven"
     exit_reason: str  # "tp", "sl", "manual", "timeout"
     closed_at: datetime
+    model: Optional[str] = None  # AI model identifier
+    session: Optional[str] = None  # Trading session identifier
+    direction: Optional[str] = None  # Trade direction
+    r_multiple: Optional[float] = None  # Risk multiple
 
     @field_validator('outcome', mode='before')
     @classmethod
