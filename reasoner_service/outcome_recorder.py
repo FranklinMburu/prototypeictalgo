@@ -64,6 +64,7 @@ class DecisionOutcomeRecorder:
         model: str = None,
         session_id: str = None,
         direction: str = None,
+        stop_loss_price: float = None,
         r_multiple: float = None,
     ) -> Optional[str]:
         """
@@ -87,7 +88,8 @@ class DecisionOutcomeRecorder:
             model: Optional AI model identifier
             session_id: Optional trading session identifier
             direction: Optional trade direction (\"long\" or \"short\")
-            r_multiple: Optional risk multiple for outcome-aware policies
+            stop_loss_price: Optional stop loss price for r_multiple calculation
+            r_multiple: Optional risk multiple (auto-computed if stop_loss_price provided)
         
         Returns:
             outcome_id: UUID of the DecisionOutcome record, or None on error
@@ -121,6 +123,15 @@ class DecisionOutcomeRecorder:
             outcome = "loss"
         else:
             outcome = "breakeven"
+        
+        # Compute r_multiple if not provided and stop_loss_price is available
+        if r_multiple is None and stop_loss_price is not None:
+            r_multiple = self._compute_r_multiple(
+                entry_price=entry_price,
+                exit_price=exit_price,
+                stop_loss_price=stop_loss_price,
+                direction=direction,
+            )
 
         # Validate exit_reason
         valid_exit_reasons = ("tp", "sl", "manual", "timeout")
@@ -151,7 +162,7 @@ class DecisionOutcomeRecorder:
 
             logger.info(
                 f"Recorded trade outcome: decision_id={decision_id} symbol={symbol} "
-                f"outcome={outcome} pnl={pnl} exit_reason={exit_reason} id={outcome_id}"
+                f"outcome={outcome} pnl={pnl} exit_reason={exit_reason} r_multiple={r_multiple} id={outcome_id}"
             )
 
             # Log integration points for future enhancement
@@ -177,6 +188,60 @@ class DecisionOutcomeRecorder:
                 f"Error recording outcome for decision_id={decision_id}: {e}",
                 exc_info=True,
             )
+            return None
+
+    def _compute_r_multiple(
+        self,
+        entry_price: float,
+        exit_price: float,
+        stop_loss_price: float,
+        direction: str = None,
+    ) -> Optional[float]:
+        """
+        Compute risk multiple (reward/risk ratio) for a trade.
+        
+        Formula:
+        - LONG:  (exit_price - entry_price) / (entry_price - stop_loss_price)
+        - SHORT: (entry_price - exit_price) / (stop_loss_price - entry_price)
+        
+        Args:
+            entry_price: Entry price
+            exit_price: Exit price
+            stop_loss_price: Stop loss price
+            direction: Trade direction ("long" or "short")
+        
+        Returns:
+            r_multiple: Risk multiple (can be negative for losses), or None if computation fails
+        """
+        try:
+            # Validate inputs
+            if not all(v is not None and isinstance(v, (int, float)) for v in [entry_price, exit_price, stop_loss_price]):
+                logger.warning(f"Cannot compute r_multiple: missing or invalid inputs (entry={entry_price}, exit={exit_price}, sl={stop_loss_price})")
+                return None
+            
+            # Compute based on direction
+            if direction and direction.lower() == "short":
+                # SHORT: (entry_price - exit_price) / (stop_loss_price - entry_price)
+                risk = stop_loss_price - entry_price
+                if risk == 0:
+                    logger.warning(f"Cannot compute r_multiple for SHORT: zero risk (entry={entry_price}, sl={stop_loss_price})")
+                    return None
+                reward = entry_price - exit_price
+                r_mult = reward / risk
+            else:
+                # LONG (default): (exit_price - entry_price) / (entry_price - stop_loss_price)
+                risk = entry_price - stop_loss_price
+                if risk == 0:
+                    logger.warning(f"Cannot compute r_multiple for LONG: zero risk (entry={entry_price}, sl={stop_loss_price})")
+                    return None
+                reward = exit_price - entry_price
+                r_mult = reward / risk
+            
+            logger.debug(f"Computed r_multiple={r_mult:.2f} for direction={direction} entry={entry_price} exit={exit_price} sl={stop_loss_price}")
+            return round(float(r_mult), 4)
+        
+        except Exception as e:
+            logger.warning(f"Error computing r_multiple: {e}")
             return None
 
     def _log_integration_points(
