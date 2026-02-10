@@ -598,6 +598,97 @@ class DecisionOrchestrator:
         self._policy_counters["pass"] += 1
         return {"result": "pass"}
 
+    async def _execute_paper_trade_if_enabled(self, decision: Dict[str, Any]) -> Optional[str]:
+        """
+        Execute a simulated paper trade when enabled (feature-flagged).
+        
+        Called after a PASS decision to:
+        1. Simulate order entry with slippage
+        2. Simulate TP/SL hit
+        3. Record outcome via outcome_recorder
+        
+        Returns:
+            outcome_id if trade was recorded, None if disabled or error
+        
+        Non-blocking: Errors logged but don't interrupt orchestration
+        """
+        try:
+            # Load paper adapter config
+            paper_cfg = self._load_paper_adapter_config()
+            if not paper_cfg.get("enabled", False):
+                return None
+            
+            # Check required fields for paper trading
+            symbol = decision.get("symbol")
+            signal_type = decision.get("signal_type")
+            timeframe = decision.get("timeframe")
+            direction = decision.get("direction", "long")
+            entry_price = decision.get("entry_price")
+            sl_price = decision.get("stop_loss_price") or decision.get("sl_price")
+            tp_price = decision.get("take_profit_price") or decision.get("tp_price")
+            decision_id = decision.get("id")
+            
+            if not all([symbol, signal_type, timeframe, entry_price, sl_price, tp_price, decision_id]):
+                logger.debug("Paper adapter: Missing required fields, skipping execution")
+                return None
+            
+            # Initialize adapter and execute
+            from .paper_execution_adapter import BrokerSimulatorAdapter, PaperExecutionConfig
+            
+            # Build adapter config from constraints
+            adapter_config = PaperExecutionConfig(
+                slippage_model=paper_cfg.get("slippage_model", "fixed_percent"),
+                slippage_fixed_pct=float(paper_cfg.get("slippage_fixed_pct", 0.05)),
+                slippage_random_min_pct=float(paper_cfg.get("slippage_random_min_pct", 0.0)),
+                slippage_random_max_pct=float(paper_cfg.get("slippage_random_max_pct", 0.1)),
+                tpsl_model=paper_cfg.get("tpsl_model", "random_bars"),
+                tpsl_random_bars_min=int(paper_cfg.get("tpsl_random_bars_min", 5)),
+                tpsl_random_bars_max=int(paper_cfg.get("tpsl_random_bars_max", 100)),
+                tpsl_random_hours_min=int(paper_cfg.get("tpsl_random_hours_min", 1)),
+                tpsl_random_hours_max=int(paper_cfg.get("tpsl_random_hours_max", 24)),
+                assume_fill_on_signal=bool(paper_cfg.get("assume_fill_on_signal", True)),
+                fill_delay_seconds=int(paper_cfg.get("fill_delay_seconds", 2)),
+                seed=paper_cfg.get("seed"),
+            )
+            
+            adapter = BrokerSimulatorAdapter(adapter_config)
+            
+            # Execute paper trade
+            result = await adapter.execute_entry(
+                decision_id=decision_id,
+                symbol=symbol,
+                signal_type=signal_type,
+                timeframe=timeframe,
+                entry_price=entry_price,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                direction=direction,
+                model=decision.get("model"),
+                session=decision.get("session"),
+            )
+            
+            # Record outcome via outcome_recorder
+            if not self._sessionmaker:
+                logger.warning("Paper adapter: sessionmaker not available, outcome not recorded")
+                return None
+            
+            from .outcome_recorder import create_outcome_recorder
+            recorder = await create_outcome_recorder(self._sessionmaker)
+            
+            outcome_args = result.to_outcome_recorder_args()
+            outcome_id = await recorder.record_trade_outcome(**outcome_args)
+            
+            logger.info(f"Paper trade recorded: outcome_id={outcome_id}")
+            return outcome_id
+        
+        except Exception as e:
+            logger.exception(f"Paper trade execution error (non-blocking): {e}")
+            return None
+
+    def _load_paper_adapter_config(self) -> Dict[str, Any]:
+        """Load paper_execution_adapter config from constraints."""
+        return getattr(self, "_constraints", {}).get("paper_execution_adapter", {})
+
     def _select_reasoning_mode(
         self,
         decision: Dict[str, Any],
@@ -926,6 +1017,13 @@ class DecisionOrchestrator:
             _ = await self.post_reasoning_policy_check(d, state={}, ctx=None)
         except Exception as e:
             logger.exception("post_reasoning_policy_check error: %s", e)
+        
+        # Paper Execution: If enabled, simulate trade execution after PASS
+        # This is non-blocking and only executes if feature flag enabled
+        try:
+            await self._execute_paper_trade_if_enabled(d)
+        except Exception as e:
+            logger.exception("Paper trade execution error (non-blocking): %s", e)
         
         # SHADOW MODE: Evaluate policies in observation-only mode (non-blocking)
         # Captures VETO decisions for audit trail, does NOT block execution

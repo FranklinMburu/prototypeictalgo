@@ -92,3 +92,34 @@ kill_switch:
     broker_disconnect: true
     drawdown_breach: true
     daily_loss_breach: true
+##
+# Paper Execution Adapter Configuration
+#
+# Simulates broker execution for paper trading without live broker.
+# Feature-flagged OFF by default. When enabled, produces trade outcomes
+# for performance attribution and memory recall veto validation.
+paper_execution_adapter:
+  enabled: false  # Set to true to enable paper trading simulation
+  
+  # Slippage model: "zero", "fixed_percent", "random_bounded"
+  slippage_model: "fixed_percent"
+  slippage_fixed_pct: 0.05        # 0.05% = 0.0005 multiplier (fixed model)
+  slippage_random_min_pct: 0.0    # Min % slippage (random model)
+  slippage_random_max_pct: 0.1    # Max % slippage (random model)
+  
+  # TP/SL hit model: "instant", "random_bars", "random_hours"
+  tpsl_model: "random_bars"
+  tpsl_random_bars_min: 5         # Min candles until TP/SL hit
+  tpsl_random_bars_max: 100       # Max candles until TP/SL hit
+  tpsl_random_hours_min: 1        # Min hours until hit (random_hours model)
+  tpsl_random_hours_max: 24       # Max hours until hit (random_hours model)
+  
+  # Fill assumptions
+  assume_fill_on_signal: true     # Fill immediately or with delay
+  fill_delay_seconds: 2           # Delay before fill (if not immediate)
+  
+  # Random seed for determinism (null = no seed, random behavior)
+  seed: null
+  
+  # Win rate for TP/SL hit distribution (70% chance of TP, 30% chance of SL)
+  tp_hit_probability: 0.70        # Probability of hitting TP (vs SL)
