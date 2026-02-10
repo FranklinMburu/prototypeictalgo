@@ -338,3 +338,40 @@ async def get_outcomes_by_symbol(
             {c.name: getattr(outcome, c.name) for c in DecisionOutcome.__table__.columns}
             for outcome in outcomes
         ]
+
+
+async def get_outcomes_by_signal_type(
+    sessionmaker,
+    symbol: str,
+    signal_type: str,
+    limit: int = 100,
+) -> List[dict]:
+    """
+    Retrieve outcomes for a specific symbol + signal_type, ordered by closed_at DESC.
+    
+    This enables memory-based veto for recurring signal patterns.
+    
+    Args:
+        sessionmaker: Async session factory
+        symbol: Trading symbol (e.g., "EURUSD")
+        signal_type: Signal type (e.g., "bullish_choch", "bearish_bos")
+        limit: Max outcomes to return
+    
+    Returns:
+        List of outcome dicts with pnl, outcome (win/loss/breakeven), etc.
+    """
+    async with sessionmaker() as session:
+        result = await session.execute(
+            select(DecisionOutcome)
+            .where(
+                (DecisionOutcome.symbol == symbol) &
+                (DecisionOutcome.signal_type == signal_type)
+            )
+            .order_by(DecisionOutcome.closed_at.desc())
+            .limit(limit)
+        )
+        outcomes = result.scalars().all()
+        return [
+            {c.name: getattr(outcome, c.name) for c in DecisionOutcome.__table__.columns}
+            for outcome in outcomes
+        ]

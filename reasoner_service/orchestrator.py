@@ -23,7 +23,10 @@ try:
     import redis.asyncio as aioredis
 except Exception:
     aioredis = None
-from .storage import create_engine_from_env_or_dsn, create_engine_and_sessionmaker, init_models, insert_decision, compute_decision_hash
+from .storage import (
+    create_engine_from_env_or_dsn, create_engine_and_sessionmaker, init_models, insert_decision, compute_decision_hash,
+    get_outcomes_by_signal_type
+)
 from .alerts import SlackNotifier, DiscordNotifier, TelegramNotifier
 from .metrics import start_metrics_server_if_enabled, decisions_processed_total, deduplicated_decisions_total, dlq_retries_total, dlq_size, redis_reconnect_attempts
 from .logging_setup import logger
@@ -375,6 +378,72 @@ class DecisionOrchestrator:
         except Exception:
             pass
 
+        # Memory Recall Veto: DB-backed deterministic veto on poor recent performance
+        try:
+            outcome_adapt_cfg = self._load_outcome_adaptation_config()
+            if outcome_adapt_cfg.get("enabled", False):
+                symbol = snapshot.get("symbol")
+                signal_type = snapshot.get("signal_type")
+                
+                if symbol and signal_type and self._sessionmaker:
+                    window_n = int(outcome_adapt_cfg.get("window_last_n_trades", 50))
+                    min_sample = int(outcome_adapt_cfg.get("min_sample_size", 20))
+                    suppress_expectancy = float(outcome_adapt_cfg.get("suppress_if", {}).get("expectancy_r", -0.05))
+                    suppress_win_rate = float(outcome_adapt_cfg.get("suppress_if", {}).get("win_rate", 0.45))
+                    
+                    # Query recent outcomes for this symbol + signal_type
+                    outcomes = await get_outcomes_by_signal_type(
+                        self._sessionmaker,
+                        symbol=symbol,
+                        signal_type=signal_type,
+                        limit=window_n,
+                    )
+                    
+                    if outcomes and len(outcomes) >= min_sample:
+                        # Convert outcomes to r_multiple format
+                        outcome_list = []
+                        for o in outcomes:
+                            outcome_type = o.get("outcome", "").lower()
+                            pnl = float(o.get("pnl", 0.0))
+                            # Convert to r_multiple: normalize by 10 (configurable in future)
+                            if outcome_type == "win":
+                                r_mult = max(1.0, pnl / 10.0)
+                            elif outcome_type == "loss":
+                                r_mult = min(-1.0, pnl / 10.0)
+                            else:
+                                r_mult = 0.0
+                            outcome_list.append({"r_multiple": r_mult, "outcome": outcome_type})
+                        
+                        expectancy, win_rate, sample_size = self._compute_expectancy_and_win_rate(outcome_list)
+                        
+                        # Veto if underperforming
+                        if expectancy < suppress_expectancy or win_rate < suppress_win_rate:
+                            self._policy_counters["veto"] += 1
+                            details = {
+                                "expectancy": expectancy,
+                                "win_rate": win_rate,
+                                "sample_size": sample_size,
+                                "thresholds": {
+                                    "expectancy_threshold": suppress_expectancy,
+                                    "win_rate_threshold": suppress_win_rate,
+                                }
+                            }
+                            self._policy_audit.append({
+                                "type": "memory_recall",
+                                "reason": "memory_underperformance",
+                                "decision_id": snapshot.get("id"),
+                                **details
+                            })
+                            logger.warning(f"Memory recall veto: {symbol}/{signal_type} expectancy={expectancy:.2f}, wr={win_rate:.2f}")
+                            return {
+                                "result": "veto",
+                                "reason": "memory_underperformance",
+                                "details": details
+                            }
+        except Exception as e:
+            logger.warning(f"Memory recall veto check failed: {e}", exc_info=True)
+            # Fail open: log warning but continue
+
         self._policy_counters["pass"] += 1
         return {"result": "pass"}
 
@@ -384,15 +453,82 @@ class DecisionOrchestrator:
     def _load_memory_config(self) -> Dict[str, Any]:
         return getattr(self, "_constraints", {}).get("memory_veto", {})
 
+    def _load_outcome_adaptation_config(self) -> Dict[str, Any]:
+        """Load outcome_adaptation config for memory recall veto."""
+        return getattr(self, "_constraints", {}).get("outcome_adaptation", {})
+
+    def _compute_expectancy_and_win_rate(self, outcomes: List[Dict[str, Any]]) -> Tuple[float, float, int]:
+        """
+        Compute expectancy (mean r_multiple) and win rate from outcomes.
+        
+        Returns:
+            (expectancy, win_rate, sample_size)
+        """
+        if not outcomes:
+            return 0.0, 0.0, 0
+        
+        valid_outcomes = [o for o in outcomes if isinstance(o.get("r_multiple"), (int, float))]
+        if not valid_outcomes:
+            return 0.0, 0.0, 0
+        
+        expectancy = sum(o["r_multiple"] for o in valid_outcomes) / len(valid_outcomes)
+        win_count = sum(1 for o in valid_outcomes if o.get("outcome", "").lower() == "win")
+        win_rate = win_count / len(valid_outcomes) if valid_outcomes else 0.0
+        
+        return expectancy, win_rate, len(valid_outcomes)
+
     async def _lookup_similar_signals(
         self, key: Tuple[str, str, str], top_n: int
     ) -> List[Dict[str, Any]]:
         """
-        Return up to `top_n` past signals similar to the given (symbol, model, session).
-        Each returned dict must include an 'r_multiple' for expectancy.
-        This delegates to your MemoryStore API (e.g. self.memory_store.query()).
+        Query DecisionOutcome table for recent similar trades.
+        
+        Similarity key: (symbol, signal_type) - deterministic DB lookup.
+        Returns outcomes ordered by timestamp DESC.
+        
+        Args:
+            key: Tuple of (symbol, signal_type, session) - uses symbol + signal_type
+            top_n: Max outcomes to return
+        
+        Returns:
+            List of outcome dicts with: pnl, outcome (win/loss/breakeven), closed_at, etc.
+            Returns empty list if sessionmaker unavailable or DB query fails.
         """
-        return []
+        try:
+            if not self._sessionmaker:
+                logger.warning("Memory recall: sessionmaker not available, returning empty")
+                return []
+            
+            symbol, signal_type, session = key
+            outcomes = await get_outcomes_by_signal_type(
+                self._sessionmaker,
+                symbol=symbol,
+                signal_type=signal_type,
+                limit=top_n,
+            )
+            # Convert outcome field to r_multiple-like metric: 1.0 for win, -1.0 for loss, 0.0 for breakeven
+            results = []
+            for outcome in outcomes:
+                outcome_type = outcome.get("outcome", "").lower()
+                if outcome_type == "win":
+                    r_multiple = max(1.0, float(outcome.get("pnl", 0.0)) / 10.0)  # Normalize PnL to r_multiple
+                elif outcome_type == "loss":
+                    r_multiple = min(-1.0, float(outcome.get("pnl", 0.0)) / 10.0)
+                else:
+                    r_multiple = 0.0
+                
+                results.append({
+                    "r_multiple": r_multiple,
+                    "outcome": outcome_type,
+                    "pnl": outcome.get("pnl", 0.0),
+                    "timestamp": outcome.get("closed_at"),
+                    "signal_type": outcome.get("signal_type"),
+                    "symbol": outcome.get("symbol"),
+                })
+            return results
+        except Exception as e:
+            logger.warning(f"Memory recall DB query failed: {e}", exc_info=True)
+            return []
 
     # --- Policy gate: post-reasoning hook ---
     async def post_reasoning_policy_check(self, reasoning_output: Dict[str, Any], state: Optional[Dict[str, Any]] = None, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
