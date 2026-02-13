@@ -32,6 +32,7 @@ from .metrics import start_metrics_server_if_enabled, decisions_processed_total,
 from .logging_setup import logger
 from .metrics_snapshot import load_metrics_snapshot
 from .policy import outcome_policy, memory_policy
+from .allowlist_loader import AllowlistLoader
 from utils.redis_wrapper import redis_op
 
 _cfg = get_settings()
@@ -147,6 +148,8 @@ class DecisionOrchestrator:
         # advanced event-driven orchestration
         self.orchestration_state = OrchestrationStateManager()
         self.signal_filter = SignalFilter(policy_store=self.policy_store)
+        # allowlist gate: load deterministic group key allowlist (fail-open)
+        self.allowlist_loader = AllowlistLoader()
         # policy shadow mode for observational evaluation
         from .policy_shadow_mode import get_shadow_mode_manager
         self.shadow_mode_manager = get_shadow_mode_manager()
@@ -201,6 +204,36 @@ class DecisionOrchestrator:
 
         if not isinstance(snapshot, dict):
             return {"result": "pass"}
+
+        # Check allowlist gate: deterministic group key filtering
+        try:
+            allowlist_cfg = self._load_allowlist_config()
+            if allowlist_cfg.get("enabled", False):
+                # Load allowlist file if not already loaded
+                allowlist_path = allowlist_cfg.get("path")
+                if allowlist_path and not self.allowlist_loader.is_enabled():
+                    self.allowlist_loader.load(allowlist_path)
+
+                # If allowlist loaded, check if group key is allowed
+                if self.allowlist_loader.is_enabled():
+                    group_key = AllowlistLoader.make_key_from_snapshot(snapshot)
+                    if group_key and not self.allowlist_loader.is_allowed(group_key):
+                        self._policy_counters["veto"] += 1
+                        entry = {
+                            "ts": int(time.time() * 1000),
+                            "action": "veto",
+                            "reason": "not_in_allowlist",
+                            "group_key": group_key,
+                            "id": snapshot.get("id"),
+                        }
+                        try:
+                            self._policy_audit.append(entry)
+                        except Exception:
+                            pass
+                        logger.warning("Policy veto applied (allowlist): %s", entry)
+                        return {"result": "veto", "reason": "not_in_allowlist", "group_key": group_key}
+        except Exception as e:
+            logger.exception("Allowlist gate check failed (fail-open): %s", e)
 
         # Check killzone via PolicyStore (with marker fallback)
         try:
@@ -472,6 +505,10 @@ class DecisionOrchestrator:
     def _load_outcome_adaptation_config(self) -> Dict[str, Any]:
         """Load outcome_adaptation config for memory recall veto."""
         return getattr(self, "_constraints", {}).get("outcome_adaptation", {})
+
+    def _load_allowlist_config(self) -> Dict[str, Any]:
+        """Load allowlist gate config."""
+        return getattr(self, "_constraints", {}).get("allowlist", {})
 
     def _compute_expectancy_and_win_rate(self, outcomes: List[Dict[str, Any]]) -> Tuple[float, float, int]:
         """
