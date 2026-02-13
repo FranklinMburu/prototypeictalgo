@@ -2,7 +2,7 @@
 """
 Batch Historical Replay with Per-Group Metrics.
 
-Groups replay results by symbol, timeframe, session, model, and direction.
+Groups replay results by symbol, timeframe, session, signal_type, and direction.
 Computes per-group metrics: sample_size, completed_trades, win_rate,
 expectancy, max_drawdown_r, max_loss_streak.
 
@@ -43,12 +43,12 @@ from backtest_replay.schemas import ReplayOutcome
 
 @dataclass
 class GroupMetrics:
-    """Metrics for a single group (symbol+timeframe+session+model+direction)."""
+    """Metrics for a single group (symbol+timeframe+session+signal_type+direction)."""
 
     symbol: str
     timeframe: str
     session: str
-    model: str  # signal_type in data terminology
+    signal_type: str
     direction: str
     sample_size: int
     completed_trades: int
@@ -184,7 +184,7 @@ def compute_group_metrics(
         symbol=signal.symbol,
         timeframe=signal.timeframe,
         session=signal.session,
-        model=signal.signal_type,
+        signal_type=signal.signal_type,
         direction=signal.direction,
         sample_size=sample_size,
         completed_trades=completed_trades,
@@ -230,13 +230,13 @@ def generate_markdown_report(metrics_list: List[GroupMetrics], output_path: Path
         "",
         "## Results by Group",
         "",
-        "| Symbol | Timeframe | Session | Model | Direction | N | Trades | Win% | Expectancy | Max DD | Max Loss Streak |",
-        "|--------|-----------|---------|-------|-----------|---|--------|------|------------|--------|-------------|",
+        "| Symbol | Timeframe | Session | Signal Type | Direction | N | Trades | Win% | Expectancy | Max DD | Max Loss Streak |",
+        "|--------|-----------|---------|-------------|-----------|---|--------|------|------------|--------|-------------|",
     ]
 
     for m in sorted_metrics:
         row = (
-            f"| {m.symbol} | {m.timeframe} | {m.session} | {m.model} | {m.direction} "
+            f"| {m.symbol} | {m.timeframe} | {m.session} | {m.signal_type} | {m.direction} "
             f"| {m.sample_size} | {m.completed_trades} | {m.win_rate:.1%} "
             f"| {m.expectancy:.4f}R | {m.max_drawdown_r:.4f}R | {m.max_loss_streak} |"
         )

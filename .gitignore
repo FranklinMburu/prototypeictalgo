@@ -54,3 +54,7 @@ htmlcov/
 
 # Generated temporary files
 __init__.py  # Auto-generated, not essential
+# Generated backtest artifacts (runtime outputs, not source)
+results/*.json
+results/*.md
+!results/.gitkeep  # Keep directory in git
