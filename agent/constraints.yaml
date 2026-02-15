@@ -134,3 +134,25 @@ paper_execution_adapter:
   
   # Win rate for TP/SL hit distribution (70% chance of TP, 30% chance of SL)
   tp_hit_probability: 0.70        # Probability of hitting TP (vs SL)
+
+# ALLOWLIST POLICY GATE
+# Deterministic signal filtering by historical edge validation.
+#
+# Purpose: Veto trades from signal groups that lack proven edge in backtest.
+# Each decision is checked against symbol|timeframe|session|signal_type|direction
+# If not in allowlist, trade is rejected at the policy gate (Stage 4, pre_reasoning).
+#
+# How to enable:
+#   1. Run scripts/run_replay_pipeline_eurusd_truefx_jan2026.py (generates allowlist.json)
+#   2. Review results/allowlist.json for approved groups
+#   3. Set allowlist.enabled = true below
+#   4. Live trades will be vetted against allowlist
+#
+allowlist:
+  enabled: false                  # Set to true to enable policy gate
+  path: "results/allowlist.json"  # Path to allowlist JSON file
+  # Thresholds used to build allowlist (for reference, see scripts/build_allowlist_from_replay.py):
+  # - min_samples: 50 (minimum trades in group)
+  # - min_expectancy: 0.2R (minimum expected value per trade)
+  # - max_drawdown: 10R (maximum consecutive losing trades)
+  # - max_streak: 7 (maximum drawdown episodes)
