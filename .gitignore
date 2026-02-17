@@ -1,3 +1,15 @@
+###############################################################################
+# GITIGNORE POLICY
+# ================
+# This repository commits CODE and DOCUMENTATION, not DATA.
+# Rationale: data/ contains large market feeds and runtime artifacts that are
+# - Regenerable from source (TrueFX API, Pine alerts, candle aggregation)
+# - Local-only (development/testing artifacts)
+# - Not shared across environments
+#
+# See data/README.md for detailed policy and regeneration instructions.
+###############################################################################
+
 # Python Environment
 venv/
 .venv/
@@ -14,6 +26,9 @@ ict_trading_system/.env
 ict_trading_system/backend/.env
 
 # Databases (Local only, not committed)
+# Rationale: trading_system.db contains 49 real webhook signals ingested from
+# TradingView Pine Script. This is state, not code. Each environment maintains
+# its own signal history from live webhooks. See data/README.md.
 *.db
 *.sqlite3
 trading_system.db
@@ -57,5 +72,13 @@ __init__.py  # Auto-generated, not essential
 # Generated backtest artifacts (runtime outputs, not source)
 results/*.json
 results/*.md
-!results/.gitkeep  # Keep directory in gitdata/processed/
+!results/.gitkeep  # Keep directory in git
+
+# Market Data & Generated Artifacts (NOT committed)
+# Rationale:
+# - data/raw/: TrueFX ticks (~34 MB) - downloadable from TrueFX API
+# - data/processed/: Candles, signals, exports (~2 MB) - regenerable via scripts
+# - data/databases/: SQLite DBs - built from live webhook ingestion
+# Each environment generates its own data locally. See data/README.md for policy.
+data/processed/
 data/raw/
