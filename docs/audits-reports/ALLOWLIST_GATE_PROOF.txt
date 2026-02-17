@@ -1,0 +1,104 @@
+ALLOWLIST POLICY GATE - IMPLEMENTATION PROOF
+
+GIT COMMIT
+==========
+72277b1 (HEAD -> main) feat: add AllowlistPolicyGate for deterministic edge filtering
+
+DIFF STATS
+==========
+4 files changed, 629 insertions(+)
+ agent/constraints.yaml                        |  11 +
+ reasoner_service/allowlist_loader.py          | 186 +++++++++++++++
+ reasoner_service/orchestrator.py              |  37 ++++
+ tests/reasoner_service/test_allowlist_gate.py | 395 ++++++++++++++++++++++++++++++++++
+
+FILES MODIFIED
+==============
+M  agent/constraints.yaml              (Added allowlist configuration)
+A  reasoner_service/allowlist_loader.py (NEW - 186 lines, thread-safe loader)
+M  reasoner_service/orchestrator.py     (Added gate to pre_reasoning_policy_check)
+A  tests/reasoner_service/test_allowlist_gate.py (NEW - 23 comprehensive tests)
+
+GIT BRANCH STATUS
+=================
+* main 72277b1 [origin/main: ahead 1] feat: add AllowlistPolicyGate for deterministic edge filtering
+
+TEST RESULTS
+============
+23/23 tests passing (100%)
+   - TestAllowlistLoaderBasic (4/4)
+   - TestAllowlistLoaderFileIO (4/4)
+   - TestAllowlistLoaderQuery (4/4)
+   - TestAllowlistPolicyGate (6/6)
+   - TestAllowlistDeterminism (2/2)
+   - TestAllowlistMetadata (3/3)
+
+IMPORTS VALIDATED
+=================
+✓ AllowlistPolicyGate successfully imported
+✓ DecisionOrchestrator initialized with allowlist_loader: AllowlistLoader
+
+IMPLEMENTATION SUMMARY
+======================
+
+AllowlistLoader (reasoner_service/allowlist_loader.py):
+- Thread-safe cached loading of JSON allowlist
+- Deterministic group keys: symbol|timeframe|session|signal_type|direction
+- Fail-open: If file missing/unreadable → gate does not veto (log warning only)
+- Metadata access: Thresholds, timestamps, group counts
+- Key methods:
+  * load(path) → Load JSON and cache allowed keys
+  * is_allowed(group_key) → Check membership
+  * is_enabled() → Check if loaded successfully
+  * make_key_from_snapshot(snapshot) → Construct key from decision
+
+Policy Gate Integration (DecisionOrchestrator):
+- Location: reasoner_service/orchestrator.py:pre_reasoning_policy_check()
+- Early gate: Runs BEFORE killzone/regime/exposure checks
+- Behavior:
+  if allowlist_enabled and group_key NOT in allowlist:
+      return {"result": "veto", "reason": "not_in_allowlist"}
+  else:
+      return {"result": "pass"}
+- Fail-open: If file missing → pass (exception handling ensures no crash)
+- Audit: Proper logging with counters and audit trail
+
+Configuration (agent/constraints.yaml):
+allowlist:
+  enabled: false  # Feature flag
+  path: "results/allowlist.json"  # Relative or absolute path
+
+BEHAVIOR MATRIX
+===============
+Scenario                       | Result | Reason
+-------------------------------|--------|--------------------
+Group in allowlist             | PASS   | Has proven edge
+Group NOT in allowlist         | VETO   | not_in_allowlist
+File missing/unreadable        | PASS   | Fail-open (log warning)
+Gate disabled                  | PASS   | Feature flag off
+Missing snapshot fields        | PASS   | Cannot compute key
+
+CONSTRAINTS HONORED
+===================
+✅ Additive Only: Does not modify existing replay, outcome, or memory policies
+✅ Deterministic Only: No randomness, same input → same output always
+✅ Thread-Safe: Locks protect concurrent access to cached set
+✅ No Stage 9/10 Modifications: Only touches pre_reasoning_policy_check hook
+
+ACTIVATION FOR LIVE TRADING
+===========================
+1. Enable the gate:
+   allowlist:
+     enabled: true
+     path: "results/allowlist.json"
+
+2. Load real data:
+   python scripts/run_historical_replay.py --candles-csv data/production/candles.csv --signals-jsonl data/production/signals.jsonl
+   python scripts/run_replay_batch.py --candles-csv data/production/candles.csv --signals-jsonl data/production/signals.jsonl
+   python scripts/build_allowlist_from_replay.py --replay-summary-json results/replay_summary.json
+
+3. Live trading will:
+   - Compute group key for each incoming signal
+   - Check allowlist before any reasoning
+   - Veto trades whose group lacks proven edge
+   - Log audit trail for all decisions
