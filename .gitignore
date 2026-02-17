@@ -82,3 +82,5 @@ results/*.md
 # Each environment generates its own data locally. See data/README.md for policy.
 data/processed/
 data/raw/
+# EXCEPTION: Commit data/README.md (policy documentation)
+!data/README.md
