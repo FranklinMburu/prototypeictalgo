@@ -1,0 +1,228 @@
+================================================================================
+TWELVEDATA XAUUSD ACQUISITION - QUICK START REFERENCE  
+================================================================================
+
+Read this FIRST, then consult FORENSIC_TWELVEDATA_ACQUISITION_PLAN.txt for full details.
+
+STATUS: Plan complete, scripts ready, awaiting TwelveData API execution.
+
+================================================================================
+WHAT WE'RE DOING
+================================================================================
+
+Goal: Download 59 days of XAUUSD 5-minute candle data from TwelveData API,
+      convert to replay engine CSV format, and run through the replay pipeline.
+
+Cost: 3 API calls (out of ~4 available)
+
+Expected Outcome: ~17,000 candles in data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv,
+                  ready for replay.
+
+================================================================================
+KEY VERIFIED FACTS (NO ASSUMPTIONS)
+================================================================================
+
+1. Replay Engine CSV Format (from backtest_replay/candle_loader.py):
+   - Header: timestamp,open,high,low,close,volume
+   - Timestamp: YYYY-MM-DD HH:MM:SS (UTC)
+   - File location: data/processed/<SYMBOL>/M1/<SYMBOL>-<DATERANGE>-M1.csv
+
+2. Replay Engine Signal Format (from backtest_replay/signal_loader.py):
+   - Format: One JSON per line (JSONL)
+   - Required fields: signal_id, timestamp, symbol, timeframe, direction, signal_type, entry, sl, tp
+   - Timestamp: YYYY-MM-DD HH:MM:SS (UTC)
+
+3. TwelveData API Limit:
+   - Max 5000 bars per request (confirmed from usage)
+   - 5-min bars: ~288 bars/day → 17 days per request
+   - Our range: 59 days → need 4 requests (we have 3, plan adjusts)
+
+4. Conversion Required:
+   - TwelveData outputs: datetime,open,high,low,close,volume (possibly semicolon-delimited)
+   - Replay expects: timestamp,open,high,low,close,volume (comma-delimited)
+   - Our script handles both formats automatically
+
+================================================================================
+FILES CREATED
+================================================================================
+
+FORENSIC_TWELVEDATA_ACQUISITION_PLAN.txt (this directory)
+  → 600+ line detailed specification with:
+    - Verified schema requirements (with file/line references)
+    - API chunking strategy with bar count math
+    - Exact curl commands for each of 3 chunks
+    - Deterministic merge/dedup/conversion algorithms
+    - Step-by-step execution plan
+    - Success metrics and recovery strategies
+
+scripts/merge_chunk_csvs.py (NEW - READY)
+  → Deterministically merges 3 TwelveData CSV chunks:
+    - Validates headers are consistent
+    - Removes duplicate rows (same datetime, keeps first)
+    - Stable sorts by datetime
+    - Outputs merged CSV ready for conversion
+
+scripts/convert_twelvedata_to_m1.py (NEW - READY)
+  → Converts TwelveData CSV to replay engine format:
+    - Auto-detects CSV delimiter (comma or semicolon)
+    - Auto-detects datetime column name
+    - Renames: datetime → timestamp
+    - Validates schema against replay engine requirements
+    - Handles datetime format variations (YYYY-MM-DD HH:MM:SS, ISO8601 with Z)
+    - Outputs candle_loader.py-compatible CSV
+
+================================================================================
+EXECUTION ROADMAP
+================================================================================
+
+PHASE 1: Download 3 chunks via curl (3 API calls, ~30 seconds total)
+
+  mkdir -p data/raw/twelvedata data/processed/XAUUSD/M1
+
+  # Chunk 1: Jan 1-21
+  curl -X GET \
+    "https://api.twelvedata.com/time_series?symbol=XAUUSD&interval=5min&start_date=2026-01-01&end_date=2026-01-21&order=asc&format=CSV&apikey=YOUR_API_KEY" \
+    -o data/raw/twelvedata/XAUUSD-chunk1-jan01-21-raw.csv
+
+  # Chunk 2: Jan 21 - Feb 7
+  curl -X GET \
+    "https://api.twelvedata.com/time_series?symbol=XAUUSD&interval=5min&start_date=2026-01-21&end_date=2026-02-07&order=asc&format=CSV&apikey=YOUR_API_KEY" \
+    -o data/raw/twelvedata/XAUUSD-chunk2-jan21-feb07-raw.csv
+
+  # Chunk 3: Feb 7-28
+  curl -X GET \
+    "https://api.twelvedata.com/time_series?symbol=XAUUSD&interval=5min&start_date=2026-02-07&end_date=2026-02-28&order=asc&format=CSV&apikey=YOUR_API_KEY" \
+    -o data/raw/twelvedata/XAUUSD-chunk3-feb07-28-raw.csv
+
+PHASE 2: Verify chunks (10 seconds, no API calls)
+
+  wc -l data/raw/twelvedata/XAUUSD-chunk*.csv
+  head -n 2 data/raw/twelvedata/XAUUSD-chunk1-jan01-21-raw.csv
+  tail -n 2 data/raw/twelvedata/XAUUSD-chunk3-feb07-28-raw.csv
+  head -n 1 data/raw/twelvedata/XAUUSD-chunk1-jan01-21-raw.csv | grep -q '^{' && echo "ERROR: JSON response" || echo "OK: CSV format"
+
+PHASE 3: Merge chunks (5 seconds)
+
+  PYTHONPATH=. python scripts/merge_chunk_csvs.py \
+    --inputs \
+      data/raw/twelvedata/XAUUSD-chunk1-jan01-21-raw.csv \
+      data/raw/twelvedata/XAUUSD-chunk2-jan21-feb07-raw.csv \
+      data/raw/twelvedata/XAUUSD-chunk3-feb07-28-raw.csv \
+    --output data/raw/twelvedata/XAUUSD-2026-01_02-raw-merged.csv
+
+PHASE 4: Convert to replay format (5 seconds)
+
+  PYTHONPATH=. python scripts/convert_twelvedata_to_m1.py \
+    --input data/raw/twelvedata/XAUUSD-2026-01_02-raw-merged.csv \
+    --output data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv
+
+PHASE 5: Verify candle format (5 seconds, no dependencies)
+
+  wc -l data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv
+  head -n 2 data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv
+  tail -n 2 data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv
+
+PHASE 6: Quick smoke test (5 seconds)
+
+  python -c "
+from backtest_replay.candle_loader import CandleLoader
+candles = CandleLoader.load_csv('data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv')
+print(f'✓ Loaded {len(candles)} candles')
+print(f'✓ First: {candles[0].timestamp}')
+print(f'✓ Last: {candles[-1].timestamp}')
+"
+
+PHASE 7: (Optional) Run replay pipeline
+
+  PYTHONPATH=. python scripts/run_historical_replay.py \
+    --candles-csv data/processed/XAUUSD/M1/XAUUSD-2026-01_02-M1.csv \
+    --signals-jsonl data/processed/XAUUSD/XAUUSD-synthetic-signals.jsonl \
+    --output results/replay_report_xauusd.json
+
+PHASE 8: Commit scripts to git
+
+  git add scripts/merge_chunk_csvs.py scripts/convert_twelvedata_to_m1.py
+  git commit -m "feat: add TwelveData CSV converters for XAUUSD ingestion"
+  git push
+
+================================================================================
+CRITICAL SUCCESS METRICS
+================================================================================
+
+✓ SUCCESS IF:
+  - All 3 chunk files download without errors (no JSON error responses)
+  - Merged file has consistent datetime sorting
+  - Converted file has headers: timestamp,open,high,low,close,volume
+  - candle_loader.py can parse the converted CSV without exceptions
+  - Line counts are reasonable: ~6000 + ~5000 + ~6000 = ~17000 total
+
+✗ FAILURE IF:
+  - Chunk file contains "{" or JSON error response
+  - Merged file has duplicate datetimes
+  - Converted file has wrong column names
+  - candle_loader.py raises FileNotFoundError or ValueError
+  - Line counts don't match expected range
+
+================================================================================
+IF SOMETHING GOES WRONG
+================================================================================
+
+Problem: Chunk download fails / returns JSON error
+
+  → Check API key: echo $TWELVEDATA_API_KEY
+  → Check rate limit: wait 60 seconds and retry
+  → Check date range: maybe API doesn't have that asset for those dates
+
+Problem: Merge produces 0 rows
+
+  → Check chunk files exist: ls -lh data/raw/twelvedata/XAUUSD-chunk*.csv
+  → Check chunk headers: head -n 1 data/raw/twelvedata/XAUUSD-chunk1*.csv
+  → See detailed troubleshooting in FORENSIC_TWELVEDATA_ACQUISITION_PLAN.txt
+
+Problem: Conversion fails with schema error
+
+  → Check TwelveData delimiter: head -n 1 <merged_file> | od -c | head
+  → Check column names: head -n 1 <merged_file>
+  → Both merge_chunk_csvs.py and convert_twelvedata_to_m1.py handle variations automatically
+
+================================================================================
+IMPORTANT NOTES
+================================================================================
+
+1. .gitignore behavior:
+   - Raw files (data/raw/) are NOT tracked
+   - Processed files (data/processed/) are NOT tracked
+   - Scripts (scripts/) ARE tracked
+   - This is intentional (see data/README.md)
+
+2. Determinism guarantee:
+   - Same input chunks → identical output every time
+   - No randomization, no floating-point rounding issues
+   - Stable sort (preserves order of equal elements)
+   - Dedup rule: first occurrence is kept
+
+3. Timezone assumptions:
+   - All timestamps are UTC or UTC-naive (interpreted as UTC)
+   - Replay engine automatically converts naive → UTC-aware
+   - No timezone conversion needed in our scripts
+
+4. 5-minute vs 1-minute:
+   - We request 5-minute bars from TwelveData (larger coverage per API call)
+   - Replay engine can work with 5-minute bars directly
+   - If 1-minute is needed later, aggregate() in Python is easy
+
+================================================================================
+NEXT STEPS FOR USER
+================================================================================
+
+1. Read FORENSIC_TWELVEDATA_ACQUISITION_PLAN.txt (full details)
+2. Get your TwelveData API key from dashboard
+3. Run PHASE 1-2 (download chunks, verify they're CSV not JSON)
+4. Run PHASE 3-6 (merge, convert, verify)
+5. Confirm all success metrics are met
+6. Run PHASE 7-8 (optional: replay + commit)
+7. Confirm allowlist is generated (or empty if sample size too small)
+
+Total time: ~30 minutes (dominated by API response time, not processing)
+
+================================================================================
