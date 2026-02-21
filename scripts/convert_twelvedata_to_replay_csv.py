@@ -362,6 +362,38 @@ class TwelveDataConverter:
         print("=" * 70 + "\n")
 
 
+def convert_csv_wrapper(
+    input_path: str,
+    output_path: str,
+    default_volume: float = 0.0,
+    verbose: bool = False,
+) -> None:
+    """
+    Programmatic wrapper function for TwelveData CSV conversion.
+    
+    Can be imported and called by other scripts (e.g., merge script).
+    
+    Args:
+        input_path: Path to input TwelveData CSV
+        output_path: Path to output replay-ready CSV
+        default_volume: Default volume value (default: 0.0)
+        verbose: Print audit report (default: False)
+        
+    Raises:
+        FileNotFoundError: If input file not found
+        ValueError: On schema validation errors
+    """
+    converter = TwelveDataConverter(
+        input_path=input_path,
+        output_path=output_path,
+        default_volume=default_volume,
+    )
+    converter.convert()
+    
+    if verbose:
+        converter.print_audit_report()
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
